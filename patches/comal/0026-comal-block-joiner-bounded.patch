@@ -1,0 +1,192 @@
+From db3a4c50764a9bf129b46933565ac3f01d1158d3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sun, 18 Oct 2026 10:19:16 +0800
+Subject: [PATCH] 0026-comal-block-joiner-bounded
+
+---
+ src/templates/primitive.rs    | 94 +++++++++++++++++++++++++++++------
+ tests/block_joiner_bounded.rs | 44 ++++++++++++++++
+ 2 files changed, 123 insertions(+), 15 deletions(-)
+ create mode 100644 tests/block_joiner_bounded.rs
+
+diff --git a/src/templates/primitive.rs b/src/templates/primitive.rs
+index a4ab392..c8df5c8 100644
+--- a/src/templates/primitive.rs
++++ b/src/templates/primitive.rs
+@@ -115,28 +115,92 @@ impl<StopType: DAMType> From<Token<u32, StopType>> for Token<f32, StopType> {
+ // (scalar mode passes the f32 bits). Now each distinct block is interned: the u32 is the index of an exact copy of
+ // the block (keyed by its values' bits in logical order, so the repeated peeks of one element give one index), and the
+ // way out returns that copy. A u32 that is not an interned index panics.
++// 0026: the 0024 table kept every distinct block that ever crossed a joiner for the whole run (one copy as key, one as
++// value): on DBLP's GraphSAGE layer it grew past 58 GB and the run slowed to a crawl. A block's reference is only needed
++// between the joiner's peek of it (conversion in) and its enqueue (conversion out), and DAM converts again on every peek
++// and on the dequeue that follows the enqueue - so a block cannot be freed at its lookup. Now: one copy per block (its
++// value bits, shared by both maps), held in two generations; a hit in the older generation moves the block to the newer
++// one; when the newer one exceeds COMAL_BLOCK_GEN_MB (default 2048 MB) the older one is dropped. Memory stays below about
++// twice that per block size. A reference to a dropped block panics (never a wrong value). Values unchanged from 0024.
++#[derive(Default)]
++struct BlockGen {
++    by_key: std::collections::HashMap<std::sync::Arc<[u32]>, u32>,
++    by_id: std::collections::HashMap<u32, std::sync::Arc<[u32]>>,
++    bytes: usize,
++}
++
++impl BlockGen {
++    fn insert(&mut self, key: std::sync::Arc<[u32]>, id: u32) {
++        self.bytes += key.len() * 4 + 64;
++        self.by_key.insert(key.clone(), id);
++        self.by_id.insert(id, key);
++    }
++    fn remove_id(&mut self, id: u32) -> Option<std::sync::Arc<[u32]>> {
++        let key = self.by_id.remove(&id)?;
++        self.by_key.remove(&key);
++        self.bytes -= key.len() * 4 + 64;
++        Some(key)
++    }
++}
++
+ pub struct BlockInterner {
+-    ids: std::collections::HashMap<Vec<u32>, u32>,
+-    blocks: Vec<ndarray::Array2<f32>>,
++    cur: BlockGen,
++    prev: BlockGen,
++    next_id: u32,
++    limit: usize,
++}
++
++impl BlockInterner {
++    fn new() -> Self {
++        let mb: usize = std::env::var("COMAL_BLOCK_GEN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
++        BlockInterner { cur: BlockGen::default(), prev: BlockGen::default(), next_id: 1, limit: mb << 20 }
++    }
++    fn promote(&mut self, id: u32) -> Option<std::sync::Arc<[u32]>> {
++        let key = self.prev.remove_id(id)?;
++        self.cur.insert(key.clone(), id);
++        Some(key)
++    }
++    fn rotate_if_full(&mut self) {
++        if self.cur.bytes > self.limit {
++            self.prev = std::mem::take(&mut self.cur);
++        }
++    }
+ }
+ 
+-fn block_intern(reg: &std::sync::Mutex<Option<BlockInterner>>, arr: ndarray::Array2<f32>) -> u32 {
+-    let key: Vec<u32> = arr.iter().map(|x| x.to_bits()).collect();
++fn block_intern(reg: &std::sync::Mutex<Option<BlockInterner>>, arr: &ndarray::ArrayView2<f32>) -> u32 {
++    let key: std::sync::Arc<[u32]> = arr.iter().map(|x| x.to_bits()).collect::<Vec<u32>>().into();
+     let mut guard = reg.lock().unwrap();
+-    let it = guard.get_or_insert_with(|| BlockInterner { ids: std::collections::HashMap::new(), blocks: Vec::new() });
+-    if let Some(id) = it.ids.get(&key) {
++    let it = guard.get_or_insert_with(BlockInterner::new);
++    if let Some(id) = it.cur.by_key.get(&key) {
+         return *id;
+     }
+-    let id = u32::try_from(it.blocks.len() + 1).expect("0024: more than u32::MAX distinct blocks through joiners");
+-    it.blocks.push(arr);
+-    it.ids.insert(key, id);
++    if let Some(id) = it.prev.by_key.get(&key).copied() {
++        it.promote(id);
++        it.rotate_if_full();
++        return id;
++    }
++    let id = it.next_id;
++    it.next_id = it.next_id.checked_add(1).expect("0026: more than u32::MAX block references through joiners");
++    it.cur.insert(key, id);
++    it.rotate_if_full();
+     id
+ }
+ 
+-fn block_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32) -> ndarray::Array2<f32> {
+-    // the copy is taken under the lock and the lock released before any panic (a panic under it would poison it)
+-    let found = reg.lock().unwrap().as_ref().and_then(|it| it.blocks.get((id as usize).wrapping_sub(1)).cloned());
+-    found.unwrap_or_else(|| panic!("0024: block reference {} is not an interned block", id))
++fn block_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32, n: usize) -> ndarray::Array2<f32> {
++    // the key is taken under the lock and the lock released before any panic (a panic under it would poison it)
++    let found = {
++        let mut guard = reg.lock().unwrap();
++        guard.as_mut().and_then(|it| match it.cur.by_id.get(&id) {
++            Some(k) => Some(k.clone()),
++            None => {
++                let k = it.promote(id);
++                it.rotate_if_full();
++                k
++            }
++        })
++    };
++    let key = found.unwrap_or_else(|| panic!("0024/0026: block reference {} is not an interned block (never interned, or dropped with an old generation)", id));
++    ndarray::Array2::from_shape_vec((n, n), key.iter().map(|b| f32::from_bits(*b)).collect()).unwrap()
+ }
+ 
+ macro_rules! block_token_conversions {
+@@ -148,7 +212,7 @@ macro_rules! block_token_conversions {
+ 
+             fn try_into(self) -> Result<Token<u32, StopType>, Self::Error> {
+                 match self {
+-                    Token::Val(val) => Ok(Token::Val(block_intern(&$reg, val.data.to_owned()))),
++                    Token::Val(val) => Ok(Token::Val(block_intern(&$reg, &val.data.view()))),
+                     Token::Stop(stop) => Ok(Token::Stop(stop)),
+                     Token::Empty => Ok(Token::Empty),
+                     Token::Done => Ok(Token::Done),
+@@ -159,7 +223,7 @@ macro_rules! block_token_conversions {
+         impl<StopType: DAMType> From<Token<u32, StopType>> for Token<Tensor<'static, f32, Ix2, $n>, StopType> {
+             fn from(value: Token<u32, StopType>) -> Self {
+                 match value {
+-                    Token::Val(id) => Token::Val(Tensor::new(block_lookup(&$reg, id))),
++                    Token::Val(id) => Token::Val(Tensor::new(block_lookup(&$reg, id, $n))),
+                     Token::Stop(stop) => Token::Stop(stop),
+                     Token::Empty => Token::Empty,
+                     Token::Done => Token::Done,
+diff --git a/tests/block_joiner_bounded.rs b/tests/block_joiner_bounded.rs
+new file mode 100644
+index 0000000..b61a9bc
+--- /dev/null
++++ b/tests/block_joiner_bounded.rs
+@@ -0,0 +1,44 @@
++// 0026: the joiner block table is bounded (two generations of COMAL_BLOCK_GEN_MB); recent blocks round-trip exactly,
++// a block used again moves to the newer generation, a block dropped with an old generation panics (never a wrong value).
++use comal::templates::primitive::Token;
++use comal::templates::tensor::Tensor;
++use ndarray::{Array2, Ix2};
++
++type VT16 = Tensor<'static, f32, Ix2, 16>;
++
++fn tile(seed: usize) -> VT16 {
++    Tensor::new(Array2::from_shape_fn((16, 16), |(r, c)| (seed * 1000 + r * 16 + c) as f32 * 0.25 - 3.0))
++}
++
++fn to_ref(t: &VT16) -> Token<u32, u32> {
++    Token::Val(t.clone()).try_into().unwrap()
++}
++
++fn back(r: Token<u32, u32>) -> Array2<f32> {
++    match Token::<VT16, u32>::from(r) {
++        Token::Val(v) => v.data.to_owned(),
++        _ => panic!("value token expected"),
++    }
++}
++
++#[test]
++fn bounded_table() {
++    std::env::set_var("COMAL_BLOCK_GEN_MB", "1"); // about 960 blocks of 16 x 16 per generation; first use in this binary
++    let keep = tile(0);
++    let r_keep = to_ref(&keep);
++    let first = tile(1);
++    let r_first = to_ref(&first);
++    for i in 2..5000 {
++        let t = tile(i);
++        let r = to_ref(&t);
++        assert_eq!(r, to_ref(&t), "a repeated peek must give the same reference");
++        assert_eq!(back(r), t.data.to_owned(), "a recent block must come back exactly");
++        if i % 300 == 0 {
++            assert_eq!(back(r_keep), keep.data.to_owned(), "a block in use must survive");
++        }
++    }
++    let lost = std::panic::catch_unwind(|| back(r_first));
++    assert!(lost.is_err(), "a block dropped with an old generation must panic, not return a value");
++    let again = tile(4999);
++    assert_eq!(back(to_ref(&again)), again.data.to_owned());
++}
+-- 
+2.43.0
+

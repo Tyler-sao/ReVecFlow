@@ -1,0 +1,907 @@
+From 87974585dc5dbe6c83fca98b2c57c495b032f53f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 15:12:12 +0800
+Subject: [PATCH] 0027-comal-vector-mode
+
+---
+ src/lib.rs                   |  23 +-
+ src/proto_driver/mod.rs      | 532 ++++++++++++++++++++++++++++++++++-
+ src/templates/accumulator.rs |  76 +++++
+ src/templates/primitive.rs   |  66 ++++-
+ src/templates/tensor.rs      |  19 ++
+ tests/vector_mode.rs         |  67 +++++
+ 6 files changed, 777 insertions(+), 6 deletions(-)
+ create mode 100644 tests/vector_mode.rs
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 8d12508..15ddeec 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ use prost::Message;
+ use proto_driver::{
+     parse_proto, parse_proto_with_outputs, parse_proto_block16, parse_proto_block32, parse_proto_block64,
+     parse_proto_true_block16, parse_proto_true_block32, parse_proto_true_block64,
+-    parse_proto_true_block16_with_outputs, parse_proto_true_block32_with_outputs,
++    parse_proto_true_block16_with_outputs, parse_proto_true_block32_with_outputs, parse_proto_vector16_with_outputs,
+     parse_proto_true_block64_with_outputs, BlockWriterOutputs,
+     proto_headers::tortilla::ComalGraph
+ };
+@@ -132,6 +132,26 @@ fn run_graph_true_block16_outputs(
+     Ok(block_outputs(passed, cycles, outputs, |t| t.data.iter().cloned().collect()))
+ }
+ 
++/// 0027: vector mode, 16 lanes: (passed, cycles, fibers, vals) as run_graph_outputs, every stored vector flattened (16 values).
++#[pyfunction]
++fn run_graph_vector16_outputs(
++    proto: String,
++    data: String,
++) -> PyResult<(bool, u64, Vec<FiberArrays>, Vec<ValArrays>)> {
++    let comal_graph = {
++        let file_contents = fs::read(proto).unwrap();
++        ComalGraph::decode(file_contents.as_slice()).unwrap()
++    };
++    let (program_builder, outputs) =
++        parse_proto_vector16_with_outputs(comal_graph, data.into(), Default::default());
++    let initialized = program_builder.initialize(Default::default()).unwrap();
++    let executed = initialized.run(Default::default());
++    let cycles = executed.elapsed_cycles().unwrap();
++    let passed = executed.passed();
++    println!("Elapsed Cycles (vector16): {}", cycles);
++    Ok(block_outputs(passed, cycles, outputs, |t| t.data.iter().cloned().collect()))
++}
++
+ /// 0021: like run_graph_true_block32, and also returns what every writer stored: (passed, cycles,
+ /// fibers, vals) as run_graph_outputs, with each stored block flattened row-major (32 x 32 values).
+ #[pyfunction]
+@@ -288,6 +308,7 @@ fn comal(py: Python, m: &PyModule) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(run_graph, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_true_block16_outputs, m)?)?;
++    m.add_function(wrap_pyfunction!(run_graph_vector16_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_true_block32_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_true_block64_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block16, m)?)?;
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 33aa438..9b4ac10 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -26,13 +26,14 @@ use dam::types::StaticallySized;
+ 
+ // Block sparse value type aliases - NxN dense blocks
+ type VT16 = Tensor<'static, f32, Ix2, 16>;
++type VV16 = Tensor<'static, f32, ndarray::Ix1, 16>; // 0027: vector mode, 16 lanes
+ type VT32 = Tensor<'static, f32, Ix2, 32>;
+ type VT64 = Tensor<'static, f32, Ix2, 64>;
+ use super::templates::wr_scanner::{CompressedWrScan, ValsWrScan};
+ use super::token_vec;
+ use crate::cli_common::SamOptions;
+ use crate::proto_driver::util::{get_crd_id, get_ref_id, get_val_id};
+-use crate::templates::accumulator::{BlockMaxReduce, MaxReduce, MaxReduceData, Spacc2, Spacc2Data};
++use crate::templates::accumulator::{BlockMaxReduce, MaxReduce, MaxReduceData, Spacc2, Spacc2Data, VecMaxReduce};
+ use crate::templates::binary::Binary;
+ use crate::templates::joiner::{NIntersect, NJoinerData, NUnion};
+ use crate::templates::new_alu::{ALUAdd, ALUMul};
+@@ -2231,6 +2232,535 @@ fn build_from_proto_block16_impl<'a>(
+     }
+ }
+ 
++/// 0027: vector mode, 16 lanes: values are 1-D vectors (the dense innermost dimension of a tensor in blocks of 16,
++/// or a scalar replicated over the lanes); returns shared references to every writer's arrays.
++pub fn parse_proto_vector16_with_outputs<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++) -> (ProgramBuilder<'a>, BlockWriterOutputs<VV16>) {
++    let mut builder = ProgramBuilder::default();
++    let mut outputs = BlockWriterOutputs::default();
++    build_from_proto_vector16_impl(
++        comal_graph,
++        base_path,
++        sam_options,
++        &mut builder,
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        Some(&mut outputs),
++    );
++    (builder, outputs)
++}
++
++/// 0027: the block16 builder with 1-D vector values (element-wise products, lane reductions); timing by Comal's
++/// element-wise convention: latency = elements processed (16 per vector), one vector per cycle.
++#[allow(clippy::too_many_arguments)]
++fn build_from_proto_vector16_impl<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++    builder: &mut ProgramBuilder<'a>,
++    refmap: &mut Channels<'a, Token<CT, ST>>,
++    crdmap: &mut Channels<'a, Token<CT, ST>>,
++    valmap: &mut Channels<'a, Token<VV16, ST>>,
++    repmap: &mut Channels<'a, Repsiggen>,
++    mut outputs: Option<&mut BlockWriterOutputs<VV16>>,
++) {
++    const N: usize = 16;
++
++    for operation in comal_graph.graph.unwrap().operators {
++        match operation.op.expect("Error processing") {
++            Op::Broadcast(op) => match op.conn.as_ref().unwrap() {
++                broadcast::Conn::Crd(in_crd) => {
++                    let in_crd_id = in_crd.input.try_conv();
++                    let out_crd_ids = in_crd.outputs.iter().map(|id| id.try_conv());
++                    let receiver = crdmap.get_receiver(in_crd_id, builder);
++                    let mut broadcast = BroadcastContext::new(receiver);
++                    out_crd_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(crdmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++                broadcast::Conn::Ref(in_ref) => {
++                    let in_ref_id = in_ref.input.try_conv();
++                    let out_ref_ids = in_ref.outputs.iter().map(|id| id.try_conv());
++                    let receiver = refmap.get_receiver(in_ref_id, builder);
++                    let mut broadcast = BroadcastContext::new(receiver);
++                    out_ref_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(refmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++                broadcast::Conn::Val(in_val) => {
++                    let in_val_id = in_val.input.try_conv();
++                    let out_val_ids = in_val.outputs.iter().map(|id| id.try_conv());
++                    let receiver = valmap.get_receiver(in_val_id, builder);
++                    let mut broadcast = BroadcastContext::new(receiver);
++                    out_val_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(valmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++                broadcast::Conn::Repsig(in_repsig) => {
++                    let in_repsig_id = in_repsig.input.try_conv();
++                    let out_repsig_ids = in_repsig.outputs.iter().map(|id| id.try_conv());
++                    let receiver = repmap.get_receiver(in_repsig_id, builder);
++                    let mut broadcast = BroadcastContext::new(receiver);
++                    out_repsig_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(repmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++            },
++            Op::Joiner(op) => {
++                // Block sparse joiner - supports both ref and val streams
++                let mut in_crds = Vec::new();
++                let mut in_refs: Vec<Box<dyn RecvAdapter<Token<CT, ST>> + Send + Sync>> = Vec::new();
++                let mut out_refs: Vec<Box<dyn SendAdapter<Token<CT, ST>> + Send + Sync>> = Vec::new();
++                op.input_pairs.iter().for_each(|pair| {
++                    let pair_crd = crdmap.get_receiver(get_crd_id(&pair.crd), builder);
++                    match pair.in_ref.clone().unwrap().stream.as_ref().unwrap() {
++                        joiner::payload::Stream::RefStream(ref_stream) => {
++                            in_refs.push(Box::new(
++                                refmap.get_receiver(get_ref_id(&Some(ref_stream.clone())), builder),
++                            ));
++                        }
++                        joiner::payload::Stream::ValStream(val_stream) => {
++                            in_refs.push(Box::new(
++                                valmap.get_receiver(get_val_id(&Some(val_stream.clone())), builder),
++                            ));
++                        }
++                    }
++                    in_crds.push(pair_crd);
++                });
++                op.output_refs.iter().for_each(|output_ref| {
++                    match output_ref.stream.as_ref().unwrap() {
++                        joiner::payload::Stream::RefStream(ref_stream) => out_refs.push(Box::new(
++                            refmap.get_sender(get_ref_id(&Some(ref_stream.clone())), builder),
++                        )),
++                        joiner::payload::Stream::ValStream(val_stream) => out_refs.push(Box::new(
++                            valmap.get_sender(get_val_id(&Some(val_stream.clone())), builder),
++                        )),
++                    }
++                });
++                let joiner_data = NJoinerData {
++                    in_crds,
++                    in_refs,
++                    out_refs,
++                    out_crd: crdmap.get_sender(get_crd_id(&op.output_crd), builder),
++                };
++
++                if let joiner::Type::Intersect = op.join_type() {
++                    builder.add_child(NIntersect::new(joiner_data))
++                } else {
++                    builder.add_child(NUnion::new(joiner_data))
++                };
++            }
++            Op::FiberLookup(op) => {
++                let in_ref = refmap.get_receiver(get_ref_id(&op.input_ref), builder);
++
++                let f_data = RdScanData {
++                    in_ref,
++                    out_crd: crdmap.get_sender(get_crd_id(&op.output_crd), builder),
++                    out_ref: refmap.get_sender(get_ref_id(&op.output_ref), builder),
++                };
++                if op.format == "compressed" {
++                    let seg_filename =
++                        base_path.join(format!("tensor_{}_mode_{}_seg", op.tensor, op.mode));
++                    let crd_filename =
++                        base_path.join(format!("tensor_{}_mode_{}_crd", op.tensor, op.mode));
++                    let seg = read_inputs(&seg_filename);
++                    let crd = read_inputs(&crd_filename);
++                    let mut crs = CompressedCrdRdScan::new(f_data, seg, crd);
++                    crs.set_timings(sam_options.compressed_read_config);
++                    builder.add_child(crs);
++                } else {
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes = read_inputs(&shape_filename);
++                    let index: usize = op.mode.try_into().unwrap();
++                    builder.add_child(UncompressedCrdRdScan::new(f_data, shapes[index.clone()]));
++                }
++            }
++            Op::FiberWrite(op) => {
++                let in_crd_id = get_crd_id(&op.input_crd);
++                let receiver = crdmap.get_receiver(in_crd_id, builder);
++                let wr = CompressedWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.fibers.push(FiberOutput { tensor: op.tensor.clone(), index: op.index.clone(), format: op.format.clone(), seg: wr.seg_arr.clone(), crd: wr.crd_arr.clone() });
++                }
++                builder.add_child(wr);
++            }
++            Op::Repeat(op) => {
++                let (out_repsig, in_repsig) = builder.bounded(DEFAULT_CHAN_SIZE);
++                match op.input_rep_sig {
++                    Some(in_rep) => match in_rep {
++                        repeat::InputRepSig::RepRef(rep_ref) => {
++                            let in_rep_ref = get_ref_id(&Some(rep_ref));
++                            let repsig_data = RepSigGenData {
++                                input: refmap.get_receiver(in_rep_ref, builder),
++                                out_repsig,
++                            };
++                            builder.add_child(RepeatSigGen::new(repsig_data));
++                        }
++                        repeat::InputRepSig::RepVal(rep_val) => {
++                            let in_rep_val = get_val_id(&Some(rep_val));
++                            let repsig_data = RepSigGenData {
++                                input: valmap.get_receiver(in_rep_val, builder),
++                                out_repsig,
++                            };
++                            builder.add_child(RepeatSigGen::new(repsig_data));
++                        }
++                    },
++                    None => todo!(),
++                }
++
++                match op.input_ref {
++                    Some(input_ref) => match input_ref {
++                        repeat::InputRef::InRef(in_ref_stream) => {
++                            let in_ref =
++                                refmap.get_receiver(get_ref_id(&Some(in_ref_stream)), builder);
++
++                            match op.output_ref {
++                                Some(out_ref) => match out_ref {
++                                    repeat::OutputRef::OutRef(out_ref_stream) => {
++                                        let rep_data = RepeatData {
++                                            in_ref,
++                                            in_repsig,
++                                            out_ref: refmap.get_sender(
++                                                get_ref_id(&Some(out_ref_stream)),
++                                                builder,
++                                            ),
++                                        };
++                                        builder.add_child(Repeat::new(rep_data));
++                                    }
++                                    repeat::OutputRef::OutVal(_) => todo!(),
++                                },
++                                None => todo!(),
++                            }
++                        }
++                        repeat::InputRef::InVal(in_val_stream) => {
++                            let in_val =
++                                valmap.get_receiver(get_val_id(&Some(in_val_stream)), builder);
++
++                            match op.output_ref {
++                                Some(out_ref) => match out_ref {
++                                    repeat::OutputRef::OutRef(_) => todo!(),
++                                    repeat::OutputRef::OutVal(out_val_stream) => {
++                                        let rep_data = RepeatData {
++                                            in_ref: in_val,
++                                            in_repsig,
++                                            out_ref: valmap.get_sender(
++                                                get_val_id(&Some(out_val_stream)),
++                                                builder,
++                                            ),
++                                        };
++                                        builder.add_child(Repeat::new(rep_data));
++                                    }
++                                },
++                                None => todo!(),
++                            }
++                        }
++                    },
++                    None => todo!(),
++                }
++            }
++            Op::Repeatsig(op) => {
++                let in_crd_id = get_crd_id(&op.input_crd);
++                let repsig_data = RepSigGenData {
++                    input: crdmap.get_receiver(in_crd_id, builder),
++                    out_repsig: repmap.get_sender(get_repsig_id(&op.output_rep_sig), builder),
++                };
++                builder.add_child(RepeatSigGen::new(repsig_data));
++            }
++            Op::Alu(op) => {
++                let mut in_val_ids = match op.conn.as_ref().unwrap() {
++                    alu::Conn::Vals(val) => val
++                        .inputs
++                        .iter()
++                        .map(|input_val| get_val_id(&Some(input_val.clone()))),
++                    alu::Conn::Crds(_) => todo!(),
++                };
++                let out_val_id = match op.conn.as_ref().unwrap() {
++                    alu::Conn::Vals(val) => get_val_id(&val.output),
++                    alu::Conn::Crds(_) => todo!(),
++                };
++                assert!(in_val_ids.len() >= 1);
++                let out_val_sender = valmap.get_sender(out_val_id, builder);
++                if in_val_ids.len() == 2 {
++                    let val_receiver1 = valmap.get_receiver(in_val_ids.next().unwrap(), builder);
++                    let val_receiver2 = valmap.get_receiver(in_val_ids.next().unwrap(), builder);
++                    // Block sparse binary ops with proper timing
++                    let (latency, ii, binary_func): (usize, usize, fn(VV16, VV16) -> VV16) = match op.stages[0].op() {
++                        alu::AluOp::Mul => (
++                            N,          // 0027: element-wise vector product, latency = elements per vector
++                            1,          // one vector per cycle
++                            |val1: VV16, val2: VV16| -> VV16 { val1 * val2 }
++                        ),
++                        alu::AluOp::Add => (
++                            N,          // 0027: element-wise latency = elements per vector
++                            1,
++                            |val1: VV16, val2: VV16| -> VV16 { val1 + val2 }
++                        ),
++                        alu::AluOp::Sub => (
++                            N,
++                            1,
++                            |val1: VV16, val2: VV16| -> VV16 { val1 - val2 }
++                        ),
++                        alu::AluOp::Elemmul => (
++                            N,
++                            1,
++                            |val1: VV16, val2: VV16| -> VV16 { val1 * val2 }
++                        ),
++                        // 0020: element-wise division, timed like Add/Sub/Elemmul above
++                        alu::AluOp::Div => (N, 1, |val1: VV16, val2: VV16| -> VV16 { Tensor::new_vec(&val1.data / &val2.data) }),
++                        _ => todo!("Unsupported binary op for block sparse"),
++                    };
++                    builder.add_child(Binary::new(
++                        val_receiver1,
++                        val_receiver2,
++                        out_val_sender,
++                        binary_func,
++                        N.try_into().unwrap(),
++                        latency.try_into().unwrap(),
++                        ii.try_into().unwrap(),
++                    ));
++                } else if in_val_ids.len() == 1 {
++                    let val_receiver1 = valmap.get_receiver(in_val_ids.next().unwrap(), builder);
++                    match op.stages[0].op() {
++                        alu::AluOp::Scalarmul => {
++                            let scalar: f32 = op.scalar as f32;
++                            let unary_func = move |val: VV16| -> VV16 {
++                                Tensor::new_vec(val.data.map(|x| x * scalar).to_owned())
++                            };
++                            builder.add_child(Unary::new(
++                                val_receiver1,
++                                out_val_sender,
++                                unary_func,
++                                N,
++                            ));
++                        }
++                        alu::AluOp::Scalaradd => {
++                            let scalar: f32 = op.scalar as f32;
++                            let unary_func = move |val: VV16| -> VV16 {
++                                Tensor::new_vec(val.data.map(|x| x + scalar).to_owned())
++                            };
++                            builder.add_child(Unary::new(
++                                val_receiver1,
++                                out_val_sender,
++                                unary_func,
++                                N,
++                            ));
++                        }
++                        // 0020: the scalar unary ops applied element-wise to a block, timed like Scalarmul/Scalaradd above (Unary, block size N)
++                        alu::AluOp::Exp => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| x.exp()).to_owned()) }, N)); }
++                        alu::AluOp::Sin => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| x.sin()).to_owned()) }, N)); }
++                        alu::AluOp::Cos => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| x.cos()).to_owned()) }, N)); }
++                        alu::AluOp::Max => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| x.max(scalar)).to_owned()) }, N)); }
++                        alu::AluOp::Scalardiv => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| x / scalar).to_owned()) }, N)); }
++                        alu::AluOp::Rsqrt => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| 1.0 / x.sqrt()).to_owned()) }, N)); }
++                        alu::AluOp::Sigmoid => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VV16| -> VV16 { Tensor::new_vec(val.data.map(|x| 1.0 / (1.0 + f32::exp(-x))).to_owned()) }, N)); }
++                        _ => todo!("Unsupported unary op for block sparse"),
++                    }
++                }
++            }
++            Op::Reduce(op) => {
++                let in_val_id = get_val_id(&op.input_val);
++                match op.reduce_type() {
++                    reduce::Type::Add => {
++                        let reduce_data = ReduceData::<VV16, ST, 4> {
++                            in_val: valmap.get_receiver(in_val_id, builder),
++                            out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
++                            sum: false,
++                        };
++                        builder.add_child(Reduce::<VV16, ST, 4>::new(reduce_data));
++                    }
++                    reduce::Type::Max => {
++                        let max_reduce_data = MaxReduceData::<VV16, ST> {
++                            in_val: valmap.get_receiver(in_val_id, builder),
++                            out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
++                        };
++                        builder.add_child(VecMaxReduce::<ST, N>::new(max_reduce_data)); /* 0027 */
++                    }
++                    reduce::Type::Addsum => {
++                        let reduce_data = ReduceData::<VV16, ST, 4> {
++                            in_val: valmap.get_receiver(in_val_id, builder),
++                            out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
++                            sum: true,
++                        };
++                        builder.add_child(Reduce::<VV16, ST, 4>::new(reduce_data));
++                    }
++                }
++            }
++            Op::CoordHold(op) => {
++                let in_inner_crd = get_crd_id(&op.input_inner_crd);
++                let in_outer_crd = get_crd_id(&op.input_outer_crd);
++
++                let crd_hold_data = CrdManagerData {
++                    in_crd_inner: crdmap.get_receiver(in_inner_crd, builder),
++                    in_crd_outer: crdmap.get_receiver(in_outer_crd, builder),
++                    out_crd_inner: crdmap.get_sender(get_crd_id(&op.output_inner_crd), builder),
++                    out_crd_outer: crdmap.get_sender(get_crd_id(&op.output_outer_crd), builder),
++                };
++                builder.add_child(CrdHold::new(crd_hold_data));
++            }
++            Op::CoordDrop(op) => {
++                let in_inner_crd = get_crd_id(&op.input_inner_crd);
++                let in_outer_crd = get_crd_id(&op.input_outer_crd);
++
++                let crd_drop_data = CrdManagerData {
++                    in_crd_inner: crdmap.get_receiver(in_inner_crd, builder),
++                    in_crd_outer: crdmap.get_receiver(in_outer_crd, builder),
++                    out_crd_inner: crdmap.get_sender(get_crd_id(&op.output_inner_crd), builder),
++                    out_crd_outer: crdmap.get_sender(get_crd_id(&op.output_outer_crd), builder),
++                };
++                builder.add_child(CrdDrop::new(crd_drop_data));
++            }
++            Op::Array(op) => {
++                // TRUE block sparse: load NxN blocks using read_inputs_vectorized
++                let in_ref_id = get_ref_id(&op.input_ref);
++                let array_data = ArrayData {
++                    in_ref: refmap.get_receiver(in_ref_id, builder),
++                    out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
++                    block_size: 4, // 0027: read latency 16 = elements per vector
++                };
++                let val_filename = base_path.join(format!("tensor_{}_mode_vals", op.tensor));
++                // Read NxN blocks using the Tensor adapter
++                let vals: Vec<VV16> = read_inputs_vectorized(&val_filename, PrimitiveType::<VV16>::new());
++                let arr = Array::new(array_data, vals);
++                builder.add_child(arr);
++            }
++            Op::Spacc(op) => {
++                let in_inner_crd = get_crd_id(&op.input_inner_crd);
++                let in_outer_crd = op.input_outer_crds[0].try_conv();
++                let in_val_id = get_val_id(&op.input_val);
++
++                let spacc_data = Spacc1Data {
++                    in_crd_inner: crdmap.get_receiver(in_inner_crd, builder),
++                    in_crd_outer: crdmap.get_receiver(in_outer_crd, builder),
++                    in_val: valmap.get_receiver(in_val_id, builder),
++                    out_crd_inner: crdmap.get_sender(get_crd_id(&op.output_inner_crd), builder),
++                    out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
++                };
++                builder.add_child(Spacc1::new(spacc_data));
++            }
++            Op::ValWrite(op) => {
++                let in_val_id = get_val_id(&op.input_val);
++                let val_receiver = valmap.get_receiver(in_val_id, builder);
++                let vals = ValsWrScan::new(val_receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.vals.push(BlockValOutput { label: op.label.clone(), vals: vals.out_val.clone() });
++                }
++                builder.add_child(vals);
++            }
++            Op::Root(op) => {
++                let out_ref_id = get_ref_id(&op.output_ref);
++
++                let root_sender = refmap.get_sender(out_ref_id, builder);
++                builder.add_child(GeneratorContext::new(
++                    || token_vec!(u32; u32; 0, "D").into_iter(),
++                    root_sender,
++                ));
++            }
++            Op::Fork(op) => match op.conn.as_ref().unwrap() {
++                fork::Conn::Crd(in_crd) => {
++                    let in_crd_id = in_crd.input.try_conv();
++                    let out_crd_ids = in_crd.outputs.iter().map(|id| id.try_conv());
++                    let receiver = crdmap.get_receiver(in_crd_id, builder);
++                    let mut broadcast = Scatter::new(receiver);
++                    out_crd_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(crdmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++                fork::Conn::Ref(in_ref) => {
++                    let in_ref_id = in_ref.input.try_conv();
++                    let out_ref_ids = in_ref.outputs.iter().map(|id| id.try_conv());
++                    let receiver = refmap.get_receiver(in_ref_id, builder);
++                    let mut scatter = Scatter::new(receiver);
++                    out_ref_ids
++                        .into_iter()
++                        .for_each(|id| scatter.add_target(refmap.get_sender(id, builder)));
++                    builder.add_child(scatter);
++                }
++                fork::Conn::Val(in_val) => {
++                    let in_val_id = in_val.input.try_conv();
++                    let out_val_ids = in_val.outputs.iter().map(|id| id.try_conv());
++                    let receiver = valmap.get_receiver(in_val_id, builder);
++                    let mut broadcast = Scatter::new(receiver);
++                    out_val_ids
++                        .into_iter()
++                        .for_each(|id| broadcast.add_target(valmap.get_sender(id, builder)));
++                    builder.add_child(broadcast);
++                }
++                fork::Conn::Repsig(_) => {
++                    panic!("Attempting to fork a repsig");
++                }
++            },
++            Op::Join(op) => match op.conn.as_ref().unwrap() {
++                join::Conn::Crd(in_crd) => {
++                    let in_crd_id = in_crd.output.try_conv();
++                    let sender = crdmap.get_sender(in_crd_id, builder);
++                    let out_crd_ids = in_crd.inputs.iter().map(|id| id.try_conv());
++                    let mut gather = Gather::new(sender);
++                    out_crd_ids
++                        .into_iter()
++                        .for_each(|id| gather.add_target(crdmap.get_receiver(id, builder)));
++                    builder.add_child(gather);
++                }
++                join::Conn::Ref(in_ref) => {
++                    let in_ref_id = in_ref.output.try_conv();
++                    let out_ref_ids = in_ref.inputs.iter().map(|id| id.try_conv());
++                    let sender = refmap.get_sender(in_ref_id, builder);
++                    let mut gather = Gather::new(sender);
++                    out_ref_ids
++                        .into_iter()
++                        .for_each(|id| gather.add_target(refmap.get_receiver(id, builder)));
++                    builder.add_child(gather);
++                }
++                join::Conn::Val(in_val) => {
++                    let in_val_id = in_val.output.try_conv();
++                    let out_val_ids = in_val.inputs.iter().map(|id| id.try_conv());
++                    let sender = valmap.get_sender(in_val_id, builder);
++                    let mut gather = Gather::new(sender);
++                    out_val_ids
++                        .into_iter()
++                        .for_each(|id| gather.add_target(valmap.get_receiver(id, builder)));
++                    builder.add_child(gather);
++                }
++                join::Conn::Repsig(_) => {
++                    panic!("Attempting to join repsig");
++                }
++            },
++            Op::Locate(op) => {
++                let in_ref_id = get_ref_id(&op.input_ref);
++                let in_crd_id = get_crd_id(&op.input_crd);
++                let out_ref1_id = get_ref_id(&op.output_ref1);
++                let out_ref2_id = get_ref_id(&op.output_ref2);
++                let out_crd_id = get_crd_id(&op.output_crd);
++                let mut locate = IterateLocate::new(
++                    refmap.get_receiver(in_ref_id, builder),
++                    crdmap.get_receiver(in_crd_id, builder),
++                    refmap.get_sender(out_ref1_id, builder),
++                    refmap.get_sender(out_ref2_id, builder),
++                    crdmap.get_sender(out_crd_id, builder),
++                );
++                if op.parent_ref.is_some() {
++                    // 0023: as the scalar builder (0015); in block mode a level's extent in the shape file is in tiles,
++                    // the unit of the references and coordinates
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(refmap.get_receiver(get_ref_id(&op.parent_ref), builder), shapes[op.mode as usize]);
++                }
++                builder.add_child(locate);
++            }
++            _ => todo!(),
++        }
++    }
++}
++
+ /// Build function for TRUE block size 32 (32x32 dense blocks as values)
+ #[allow(clippy::too_many_arguments)]
+ pub fn build_from_proto_block32<'a>(
+diff --git a/src/templates/accumulator.rs b/src/templates/accumulator.rs
+index 6ef516d..610b0dc 100644
+--- a/src/templates/accumulator.rs
++++ b/src/templates/accumulator.rs
+@@ -976,6 +976,82 @@ where
+     }
+ }
+ 
++// 0027: max reduction in vector mode: element-wise max over the vectors of a fiber (from -inf), then the max over the
++// lanes broadcast to every lane at the fiber's stop (the row max when the lanes are a row's columns). Timing as MaxReduce.
++#[context_macro]
++pub struct VecMaxReduce<StopType: Clone, const N: usize> {
++    max_reduce_data: MaxReduceData<super::tensor::Tensor<'static, f32, ndarray::Ix1, N>, StopType>,
++}
++
++impl<StopType: DAMType, const N: usize> VecMaxReduce<StopType, N>
++where
++    VecMaxReduce<StopType, N>: Context,
++{
++    pub fn new(max_reduce_data: MaxReduceData<super::tensor::Tensor<'static, f32, ndarray::Ix1, N>, StopType>) -> Self {
++        let red = VecMaxReduce { max_reduce_data, context_info: Default::default() };
++        (red.max_reduce_data.in_val).attach_receiver(&red);
++        (red.max_reduce_data.out_val).attach_sender(&red);
++        red
++    }
++}
++
++impl<StopType, const N: usize> Context for VecMaxReduce<StopType, N>
++where
++    super::tensor::Tensor<'static, f32, ndarray::Ix1, N>: DAMType,
++    StopType: DAMType + std::ops::Sub<u32, Output = StopType> + std::cmp::PartialEq,
++{
++    fn init(&mut self) {}
++
++    fn run(&mut self) {
++        let neg = || ndarray::Array1::<f32>::from_elem(N, f32::NEG_INFINITY);
++        let mut acc = neg();
++        loop {
++            match self.max_reduce_data.in_val.dequeue(&self.time) {
++                Ok(curr_in) => match curr_in.data {
++                    Token::Val(val) => {
++                        acc.zip_mut_with(&val.data, |a, b| {
++                            if *b > *a {
++                                *a = *b
++                            }
++                        });
++                    }
++                    Token::Stop(stkn) => {
++                        let curr_time = self.time.tick();
++                        let m = acc.fold(f32::NEG_INFINITY, |m, x| m.max(*x));
++                        self.max_reduce_data
++                            .out_val
++                            .enqueue(&self.time, ChannelElement::new(curr_time + 1,
++                                Token::Val(super::tensor::Tensor::new_vec(ndarray::Array1::from_elem(N, m)))))
++                            .unwrap();
++                        acc = neg();
++                        if stkn != StopType::default() {
++                            self.max_reduce_data
++                                .out_val
++                                .enqueue(&self.time, ChannelElement::new(curr_time + 1, Token::Stop(stkn - 1)))
++                                .unwrap();
++                        }
++                    }
++                    Token::Empty => {
++                        continue;
++                    }
++                    Token::Done => {
++                        let curr_time = self.time.tick();
++                        self.max_reduce_data
++                            .out_val
++                            .enqueue(&self.time, ChannelElement::new(curr_time + 1, Token::Done))
++                            .unwrap();
++                        return;
++                    }
++                },
++                Err(_) => {
++                    panic!("Unexpected end of stream");
++                }
++            }
++            self.time.incr_cycles(1);
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+ 
+diff --git a/src/templates/primitive.rs b/src/templates/primitive.rs
+index c8df5c8..95b8767 100644
+--- a/src/templates/primitive.rs
++++ b/src/templates/primitive.rs
+@@ -167,8 +167,7 @@ impl BlockInterner {
+     }
+ }
+ 
+-fn block_intern(reg: &std::sync::Mutex<Option<BlockInterner>>, arr: &ndarray::ArrayView2<f32>) -> u32 {
+-    let key: std::sync::Arc<[u32]> = arr.iter().map(|x| x.to_bits()).collect::<Vec<u32>>().into();
++fn intern_key(reg: &std::sync::Mutex<Option<BlockInterner>>, key: std::sync::Arc<[u32]>) -> u32 {
+     let mut guard = reg.lock().unwrap();
+     let it = guard.get_or_insert_with(BlockInterner::new);
+     if let Some(id) = it.cur.by_key.get(&key) {
+@@ -186,7 +185,11 @@ fn block_intern(reg: &std::sync::Mutex<Option<BlockInterner>>, arr: &ndarray::Ar
+     id
+ }
+ 
+-fn block_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32, n: usize) -> ndarray::Array2<f32> {
++fn block_intern(reg: &std::sync::Mutex<Option<BlockInterner>>, arr: &ndarray::ArrayView2<f32>) -> u32 {
++    intern_key(reg, arr.iter().map(|x| x.to_bits()).collect::<Vec<u32>>().into())
++}
++
++fn key_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32) -> std::sync::Arc<[u32]> {
+     // the key is taken under the lock and the lock released before any panic (a panic under it would poison it)
+     let found = {
+         let mut guard = reg.lock().unwrap();
+@@ -199,7 +202,11 @@ fn block_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32, n: usize
+             }
+         })
+     };
+-    let key = found.unwrap_or_else(|| panic!("0024/0026: block reference {} is not an interned block (never interned, or dropped with an old generation)", id));
++    found.unwrap_or_else(|| panic!("0024/0026: block reference {} is not an interned block (never interned, or dropped with an old generation)", id))
++}
++
++fn block_lookup(reg: &std::sync::Mutex<Option<BlockInterner>>, id: u32, n: usize) -> ndarray::Array2<f32> {
++    let key = key_lookup(reg, id);
+     ndarray::Array2::from_shape_vec((n, n), key.iter().map(|b| f32::from_bits(*b)).collect()).unwrap()
+ }
+ 
+@@ -237,6 +244,57 @@ block_token_conversions!(64, BLOCKS64);
+ block_token_conversions!(32, BLOCKS32);
+ block_token_conversions!(16, BLOCKS16);
+ 
++// 0027: vector mode (1-D values of N lanes): the joiner conversions of 0024/0026 (same interner, own table), and the
++// lane sum of a reduction whose result is broadcast over the lanes (the 1-D counterpart of the block row sum).
++macro_rules! vector_token_conversions {
++    ($n:literal, $reg:ident) => {
++        static $reg: std::sync::Mutex<Option<BlockInterner>> = std::sync::Mutex::new(None);
++
++        impl<StopType: DAMType> TryInto<Token<u32, StopType>> for Token<Tensor<'static, f32, ndarray::Ix1, $n>, StopType> {
++            type Error = u32;
++
++            fn try_into(self) -> Result<Token<u32, StopType>, Self::Error> {
++                match self {
++                    Token::Val(val) => Ok(Token::Val(intern_key(&$reg, val.data.iter().map(|x| x.to_bits()).collect::<Vec<u32>>().into()))),
++                    Token::Stop(stop) => Ok(Token::Stop(stop)),
++                    Token::Empty => Ok(Token::Empty),
++                    Token::Done => Ok(Token::Done),
++                }
++            }
++        }
++
++        impl<StopType: DAMType> From<Token<u32, StopType>> for Token<Tensor<'static, f32, ndarray::Ix1, $n>, StopType> {
++            fn from(value: Token<u32, StopType>) -> Self {
++                match value {
++                    Token::Val(id) => Token::Val(Tensor::new_vec(ndarray::Array1::from_vec(
++                        key_lookup(&$reg, id).iter().map(|b| f32::from_bits(*b)).collect()))),
++                    Token::Stop(stop) => Token::Stop(stop),
++                    Token::Empty => Token::Empty,
++                    Token::Done => Token::Done,
++                }
++            }
++        }
++    };
++}
++
++vector_token_conversions!(16, VECTORS16);
++
++impl<StopType: DAMType, A: DAMType, const M: usize, const N: usize> FinalReduce<StopType, M>
++    for Token<Tensor<'static, A, ndarray::Ix1, N>, StopType>
++where
++    A: dam::types::StaticallySized + Zero + std::ops::Add<Output = A>,
++{
++    fn sum_axis(self) -> Self {
++        match self {
++            Token::Val(val) => {
++                let s = val.data.sum();
++                Token::Val(Tensor::new_vec(ndarray::Array1::from_elem(N, s)))
++            }
++            _ => panic!("Should not reach this case in sum_axis"),
++        }
++    }
++}
++
+ impl<T: num::Float> Exp for T {
+     fn exp(self) -> Self {
+         num::Float::exp(self)
+diff --git a/src/templates/tensor.rs b/src/templates/tensor.rs
+index 191dc97..f932210 100644
+--- a/src/templates/tensor.rs
++++ b/src/templates/tensor.rs
+@@ -323,3 +323,22 @@ where
+         }
+     }
+ }
++
++// 0027: vector values (1-D, N lanes) for the vector mode
++impl<'a, A, const N: usize> Tensor<'a, A, Ix1, N>
++where
++    A: DAMType + dam::types::StaticallySized,
++{
++    pub fn new_vec(raw_data: ndarray::Array1<A>) -> Tensor<'a, A, Ix1, N> {
++        Tensor::<'a, A, Ix1, N> { data: CowArray::from(raw_data) }
++    }
++}
++
++impl<'a, A: DAMType, const N: usize> std::fmt::Display for Tensor<'a, A, Ix1, N> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        for value in self.data.iter() {
++            writeln!(f, "{:?}", value).unwrap();
++        }
++        Ok(())
++    }
++}
+diff --git a/tests/vector_mode.rs b/tests/vector_mode.rs
+new file mode 100644
+index 0000000..3411a2a
+--- /dev/null
++++ b/tests/vector_mode.rs
+@@ -0,0 +1,67 @@
++// 0027: vector mode values (1-D, 16 lanes): element-wise arithmetic, lane sum / lane max reductions, joiner round trip.
++use comal::templates::accumulator::{MaxReduceData, VecMaxReduce};
++use comal::templates::primitive::{FinalReduce, Token};
++use comal::templates::tensor::Tensor;
++use dam::simulation::*;
++use dam::utility_contexts::{CheckerContext, GeneratorContext};
++use ndarray::{Array1, Ix1};
++
++type VV16 = Tensor<'static, f32, Ix1, 16>;
++
++fn v(f: impl Fn(usize) -> f32) -> VV16 {
++    Tensor::new_vec(Array1::from_shape_fn(16, f))
++}
++
++#[test]
++fn elementwise_and_lane_sum() {
++    let a = v(|i| i as f32 + 1.0);
++    let b = v(|i| 2.0 - i as f32 * 0.5);
++    let p = a.clone() * b.clone();
++    for i in 0..16 {
++        assert_eq!(p.data[i], (i as f32 + 1.0) * (2.0 - i as f32 * 0.5));
++    }
++    let mut acc = VV16::default();
++    acc += a.clone();
++    acc += b.clone();
++    assert_eq!(acc.data[3], a.data[3] + b.data[3]);
++    let s = <Token<VV16, u32> as FinalReduce<u32, 4>>::sum_axis(Token::Val(a.clone()));
++    match s {
++        Token::Val(t) => assert!(t.data.iter().all(|x| *x == (1..=16).sum::<i32>() as f32)),
++        _ => panic!("value expected"),
++    }
++}
++
++#[test]
++fn joiner_round_trip() {
++    let a = v(|i| i as f32 * 1.25 - 3.0);
++    let r: Token<u32, u32> = Token::Val(a.clone()).try_into().unwrap();
++    let r2: Token<u32, u32> = Token::Val(a.clone()).try_into().unwrap();
++    assert_eq!(r, r2);
++    match Token::<VV16, u32>::from(r) {
++        Token::Val(t) => assert_eq!(t.data, a.data),
++        _ => panic!("value expected"),
++    }
++}
++
++#[test]
++fn lane_max_over_vectors() {
++    let a = v(|i| i as f32 - 20.0);            // all negative
++    let b = v(|i| if i == 5 { 7.5 } else { -100.0 });
++    let c = v(|i| -(i as f32) - 1.0);           // all negative, alone in the second fiber
++    let expect = vec![
++        Token::<VV16, u32>::Val(v(|_| 7.5)),
++        Token::Val(v(|_| -1.0)),
++        Token::Stop(0),
++        Token::Done,
++    ];
++    let mut ctx = ProgramBuilder::default();
++    let (snd, rcv) = ctx.unbounded::<Token<VV16, u32>>();
++    let (osnd, orcv) = ctx.unbounded::<Token<VV16, u32>>();
++    ctx.add_child(GeneratorContext::new(
++        move || vec![Token::Val(a.clone()), Token::Val(b.clone()), Token::Stop(0), Token::Val(c.clone()), Token::Stop(1), Token::Done].into_iter(),
++        snd,
++    ));
++    ctx.add_child(VecMaxReduce::<u32, 16>::new(MaxReduceData { in_val: rcv, out_val: osnd }));
++    ctx.add_child(CheckerContext::new(move || expect.clone().into_iter(), orcv));
++    ctx.initialize(Default::default()).unwrap().run(Default::default());
++}
+-- 
+2.43.0
+

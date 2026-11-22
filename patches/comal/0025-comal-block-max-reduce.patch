@@ -1,0 +1,197 @@
+From 3d64453cf700cd5d624a0b616e0726e4fefc72a5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 17 Oct 2026 13:05:10 +0800
+Subject: [PATCH] 0025-comal-block-max-reduce
+
+---
+ src/proto_driver/mod.rs      |  8 ++--
+ src/templates/accumulator.rs | 83 ++++++++++++++++++++++++++++++++++++
+ tests/block_max_reduce.rs    | 42 ++++++++++++++++++
+ 3 files changed, 129 insertions(+), 4 deletions(-)
+ create mode 100644 tests/block_max_reduce.rs
+
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 9cc6fe7..33aa438 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -32,7 +32,7 @@ use super::templates::wr_scanner::{CompressedWrScan, ValsWrScan};
+ use super::token_vec;
+ use crate::cli_common::SamOptions;
+ use crate::proto_driver::util::{get_crd_id, get_ref_id, get_val_id};
+-use crate::templates::accumulator::{MaxReduce, MaxReduceData, Spacc2, Spacc2Data};
++use crate::templates::accumulator::{BlockMaxReduce, MaxReduce, MaxReduceData, Spacc2, Spacc2Data};
+ use crate::templates::binary::Binary;
+ use crate::templates::joiner::{NIntersect, NJoinerData, NUnion};
+ use crate::templates::new_alu::{ALUAdd, ALUMul};
+@@ -2052,7 +2052,7 @@ fn build_from_proto_block16_impl<'a>(
+                             in_val: valmap.get_receiver(in_val_id, builder),
+                             out_val: valmap.get_sender(get_val_id(&op.output_val), builder),
+                         };
+-                        builder.add_child(MaxReduce::new(max_reduce_data, VT16::default()));
++                        builder.add_child(BlockMaxReduce::<ST, N>::new(max_reduce_data)); /* 0025 */
+                     }
+                     reduce::Type::Addsum => {
+                         let reduce_data = ReduceData::<VT16, ST, N> {
+@@ -2439,7 +2439,7 @@ fn build_from_proto_block32_impl<'a>(
+                     reduce::Type::Max => {
+                         let in_val = valmap.get_receiver(in_val_id, builder);
+                         let out_val = valmap.get_sender(get_val_id(&op.output_val), builder);
+-                        builder.add_child(MaxReduce::new(MaxReduceData { in_val, out_val }, VT32::default()));
++                        builder.add_child(BlockMaxReduce::<ST, N>::new(MaxReduceData { in_val, out_val })); /* 0025 */
+                     }
+                     reduce::Type::Addsum => {
+                         let in_val = valmap.get_receiver(in_val_id, builder);
+@@ -2702,7 +2702,7 @@ fn build_from_proto_block64_impl<'a>(
+                 let out_val = valmap.get_sender(get_val_id(&op.output_val), builder);
+                 match op.reduce_type() {
+                     reduce::Type::Add => { builder.add_child(Reduce::<VT64, ST, N>::new(ReduceData { in_val, out_val, sum: false })); }
+-                    reduce::Type::Max => { builder.add_child(MaxReduce::new(MaxReduceData { in_val, out_val }, VT64::default())); }
++                    reduce::Type::Max => { builder.add_child(BlockMaxReduce::<ST, N>::new(MaxReduceData { in_val, out_val })); /* 0025 */ }
+                     reduce::Type::Addsum => { builder.add_child(Reduce::<VT64, ST, N>::new(ReduceData { in_val, out_val, sum: true })); }
+                 }
+             }
+diff --git a/src/templates/accumulator.rs b/src/templates/accumulator.rs
+index 5be7935..6ef516d 100644
+--- a/src/templates/accumulator.rs
++++ b/src/templates/accumulator.rs
+@@ -893,6 +893,89 @@ where
+     }
+ }
+ 
++// 0025: max reduction in true-block mode. MaxReduce compares whole blocks with PartialOrd (lexicographic over the raw
++// values) and keeps one whole block, starting from an all-zero block - not a row max: for a row of positive values it
++// returns the row itself, so a softmax's x - max(x) became 0. BlockMaxReduce keeps the element-wise max over the
++// blocks of a fiber (starting from -inf), and at the fiber's stop takes the max along each row of that block,
++// broadcast over the block's columns - the max counterpart of the block sum reduction (Addsum, FinalReduce::sum_axis).
++// Timing as MaxReduce (one cycle per token, output one cycle after the stop): values fixed, Comal's timing unchanged.
++#[context_macro]
++pub struct BlockMaxReduce<StopType: Clone, const N: usize> {
++    max_reduce_data: MaxReduceData<super::tensor::Tensor<'static, f32, ndarray::Ix2, N>, StopType>,
++}
++
++impl<StopType: DAMType, const N: usize> BlockMaxReduce<StopType, N>
++where
++    BlockMaxReduce<StopType, N>: Context,
++{
++    pub fn new(max_reduce_data: MaxReduceData<super::tensor::Tensor<'static, f32, ndarray::Ix2, N>, StopType>) -> Self {
++        let red = BlockMaxReduce { max_reduce_data, context_info: Default::default() };
++        (red.max_reduce_data.in_val).attach_receiver(&red);
++        (red.max_reduce_data.out_val).attach_sender(&red);
++        red
++    }
++}
++
++impl<StopType, const N: usize> Context for BlockMaxReduce<StopType, N>
++where
++    super::tensor::Tensor<'static, f32, ndarray::Ix2, N>: DAMType,
++    StopType: DAMType + std::ops::Sub<u32, Output = StopType> + std::cmp::PartialEq,
++{
++    fn init(&mut self) {}
++
++    fn run(&mut self) {
++        let neg = || ndarray::Array2::<f32>::from_elem((N, N), f32::NEG_INFINITY);
++        let mut acc = neg();
++        loop {
++            match self.max_reduce_data.in_val.dequeue(&self.time) {
++                Ok(curr_in) => match curr_in.data {
++                    Token::Val(val) => {
++                        acc.zip_mut_with(&val.data, |a, b| {
++                            if *b > *a {
++                                *a = *b
++                            }
++                        });
++                    }
++                    Token::Stop(stkn) => {
++                        let curr_time = self.time.tick();
++                        let rows = acc.fold_axis(ndarray::Axis(1), f32::NEG_INFINITY, |m, x| m.max(*x));
++                        let out = rows.insert_axis(ndarray::Axis(1)).broadcast((N, N)).unwrap().to_owned();
++                        self.max_reduce_data
++                            .out_val
++                            .enqueue(
++                                &self.time,
++                                ChannelElement::new(curr_time + 1, Token::Val(super::tensor::Tensor::new(out))),
++                            )
++                            .unwrap();
++                        acc = neg();
++                        if stkn != StopType::default() {
++                            self.max_reduce_data
++                                .out_val
++                                .enqueue(&self.time, ChannelElement::new(curr_time + 1, Token::Stop(stkn - 1)))
++                                .unwrap();
++                        }
++                    }
++                    Token::Empty => {
++                        continue;
++                    }
++                    Token::Done => {
++                        let curr_time = self.time.tick();
++                        self.max_reduce_data
++                            .out_val
++                            .enqueue(&self.time, ChannelElement::new(curr_time + 1, Token::Done))
++                            .unwrap();
++                        return;
++                    }
++                },
++                Err(_) => {
++                    panic!("Unexpected end of stream");
++                }
++            }
++            self.time.incr_cycles(1);
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+ 
+diff --git a/tests/block_max_reduce.rs b/tests/block_max_reduce.rs
+new file mode 100644
+index 0000000..66a64d0
+--- /dev/null
++++ b/tests/block_max_reduce.rs
+@@ -0,0 +1,42 @@
++// 0025: true-block max reduction = per-row max over all blocks of a fiber, broadcast over the block's columns.
++use comal::templates::accumulator::{BlockMaxReduce, MaxReduceData};
++use comal::templates::primitive::Token;
++use comal::templates::tensor::Tensor;
++use dam::simulation::*;
++use dam::utility_contexts::{CheckerContext, GeneratorContext};
++use ndarray::{Array2, Ix2};
++
++type VT16 = Tensor<'static, f32, Ix2, 16>;
++
++fn rowmax(m: &Array2<f32>) -> Array2<f32> {
++    let v: Vec<f32> = m.rows().into_iter().map(|row| row.iter().cloned().fold(f32::NEG_INFINITY, f32::max)).collect();
++    Array2::from_shape_fn((16, 16), |(r, _)| v[r])
++}
++
++#[test]
++fn row_max_over_blocks() {
++    let a = Array2::from_shape_fn((16, 16), |(r, c)| (r as f32) * 3.0 - (c as f32) * 0.5 + 100.0); // positive
++    let b = Array2::from_shape_fn((16, 16), |(r, c)| if c == 5 { 1000.0 + r as f32 } else { -7.0 });
++    let neg = Array2::from_shape_fn((16, 16), |(r, c)| -1.0 - (r * 16 + c) as f32); // all < 0
++    let ab = Array2::from_shape_fn((16, 16), |(r, c)| a[[r, c]].max(b[[r, c]]));
++    let (va, vb, vn) = (VT16::new(a.clone()), VT16::new(b.clone()), VT16::new(neg.clone()));
++    let expect = vec![
++        Token::<VT16, u32>::Val(VT16::new(rowmax(&ab))), // fiber 1: blocks a and b
++        Token::Val(VT16::new(rowmax(&neg))),             // fiber 2: one all-negative block (not clipped at 0)
++        Token::Stop(0),
++        Token::Done,
++    ];
++    let mut ctx = ProgramBuilder::default();
++    let (snd, rcv) = ctx.unbounded::<Token<VT16, u32>>();
++    let (osnd, orcv) = ctx.unbounded::<Token<VT16, u32>>();
++    ctx.add_child(GeneratorContext::new(
++        move || {
++            vec![Token::Val(va.clone()), Token::Val(vb.clone()), Token::Stop(0), Token::Val(vn.clone()), Token::Stop(1), Token::Done]
++                .into_iter()
++        },
++        snd,
++    ));
++    ctx.add_child(BlockMaxReduce::<u32, 16>::new(MaxReduceData { in_val: rcv, out_val: osnd }));
++    ctx.add_child(CheckerContext::new(move || expect.clone().into_iter(), orcv));
++    ctx.initialize(Default::default()).unwrap().run(Default::default());
++}
+-- 
+2.43.0
+

@@ -1,0 +1,198 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 6c08236..cdd8706 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,7 +7,7 @@ use std::{fs, panic};
+ use dam::simulation::*;
+ use prost::Message;
+ use proto_driver::{
+-    parse_proto, parse_proto_block16, parse_proto_block32, parse_proto_block64,
++    parse_proto, parse_proto_with_outputs, parse_proto_block16, parse_proto_block32, parse_proto_block64,
+     parse_proto_true_block16, parse_proto_true_block32, parse_proto_true_block64,
+     proto_headers::tortilla::ComalGraph
+ };
+@@ -37,6 +37,50 @@ fn run_graph(proto: String, data: String) -> PyResult<(bool, u64)> {
+     return Ok(return_tuple);
+ }
+ 
++/// Fiber writer contents: (tensor, index variable, format, seg, crd)
++type FiberArrays = (String, String, String, Vec<u32>, Vec<u32>);
++/// Value writer contents: (label, values)
++type ValArrays = (String, Vec<f32>);
++
++/// Like run_graph (scalar mode), and also returns what every writer stored, read after the
++/// simulation has finished: (passed, cycles, fibers, vals), each list in the order the writers
++/// appear in the proto. Comal does not know dense shapes; the caller supplies them.
++#[pyfunction]
++fn run_graph_outputs(
++    proto: String,
++    data: String,
++) -> PyResult<(bool, u64, Vec<FiberArrays>, Vec<ValArrays>)> {
++    let comal_graph = {
++        let file_contents = fs::read(proto).unwrap();
++        ComalGraph::decode(file_contents.as_slice()).unwrap()
++    };
++    let (program_builder, outputs) =
++        parse_proto_with_outputs(comal_graph, data.into(), Default::default());
++    let initialized = program_builder.initialize(Default::default()).unwrap();
++    let executed = initialized.run(Default::default());
++    let cycles = executed.elapsed_cycles().unwrap();
++    let passed = executed.passed();
++    println!("Elapsed Cycles: {}", cycles);
++    let fibers = outputs
++        .fibers
++        .into_iter()
++        .map(|f| {
++            let seg = f.seg.lock().unwrap().clone();
++            let crd = f.crd.lock().unwrap().clone();
++            (f.tensor, f.index, f.format, seg, crd)
++        })
++        .collect();
++    let vals = outputs
++        .vals
++        .into_iter()
++        .map(|v| {
++            let values = v.vals.lock().unwrap().clone();
++            (v.label, values)
++        })
++        .collect();
++    Ok((passed, cycles, fibers, vals))
++}
++
+ /// Runs proto graph with block_size=16 (for block sparse mode)
+ #[pyfunction]
+ fn run_graph_block16(proto: String, data: String) -> PyResult<(bool, u64)> {
+@@ -149,6 +193,7 @@ fn run_graph_true_block64(proto: String, data: String) -> PyResult<(bool, u64)>
+ #[pymodule]
+ fn comal(py: Python, m: &PyModule) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(run_graph, m)?)?;
++    m.add_function(wrap_pyfunction!(run_graph_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block16, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block32, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block64, m)?)?;
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 06700af..7450162 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -6,6 +6,7 @@ use std::collections::HashMap;
+ use std::env;
+ use std::marker::PhantomData;
+ use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
+ 
+ use self::proto_headers::tortilla::operation::*;
+ use self::util::{get_repsig_id, AsStreamID};
+@@ -123,6 +124,30 @@ where
+     }
+ }
+ 
++/// Arrays filled by one FiberWrite during simulation (one level of an output tensor), shared
++/// with the writer so that they can be read after the run. `index` is the writer's index
++/// variable as emitted by the compiler; coordinates and segments are u32.
++pub struct FiberOutput {
++    pub tensor: String,
++    pub index: String,
++    pub format: String,
++    pub seg: Arc<Mutex<Vec<u32>>>,
++    pub crd: Arc<Mutex<Vec<u32>>>,
++}
++
++/// Values filled by one ValWrite during simulation (f32).
++pub struct ValOutput {
++    pub label: String,
++    pub vals: Arc<Mutex<Vec<f32>>>,
++}
++
++/// Every writer of a graph, in the order the operators appear in the proto.
++#[derive(Default)]
++pub struct WriterOutputs {
++    pub fibers: Vec<FiberOutput>,
++    pub vals: Vec<ValOutput>,
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn build_from_proto<'a>(
+     comal_graph: ComalGraph,
+@@ -133,6 +158,24 @@ pub fn build_from_proto<'a>(
+     crdmap: &mut Channels<'a, Token<CT, ST>>,
+     valmap: &mut Channels<'a, Token<VT, ST>>,
+     repmap: &mut Channels<'a, Repsiggen>,
++) {
++    build_from_proto_impl(
++        comal_graph, base_path, sam_options, builder, refmap, crdmap, valmap, repmap, None,
++    );
++}
++
++/// build_from_proto, additionally recording the writers' arrays in `outputs` if given.
++#[allow(clippy::too_many_arguments)]
++fn build_from_proto_impl<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++    builder: &mut ProgramBuilder<'a>,
++    refmap: &mut Channels<'a, Token<CT, ST>>,
++    crdmap: &mut Channels<'a, Token<CT, ST>>,
++    valmap: &mut Channels<'a, Token<VT, ST>>,
++    repmap: &mut Channels<'a, Repsiggen>,
++    mut outputs: Option<&mut WriterOutputs>,
+ ) {
+     // Read HBM setting from environment variable (default: enabled)
+     let enable_hbm = env::var("COMAL_ENABLE_HBM")
+@@ -301,6 +344,15 @@ pub fn build_from_proto<'a>(
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let receiver = crdmap.get_receiver(in_crd_id, builder);
+                 let mut wr = CompressedWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.fibers.push(FiberOutput {
++                        tensor: op.tensor.clone(),
++                        index: op.index.clone(),
++                        format: op.format.clone(),
++                        seg: wr.seg_arr.clone(),
++                        crd: wr.crd_arr.clone(),
++                    });
++                }
+                 if let Some(hbm) = hbm_ctx_opt.as_mut() {
+                     // Hook HBM writer bundles for crd and seg
+                     let (crd_addr_snd, crd_addr_rcv) = builder.unbounded::<ParAddrs>();
+@@ -697,6 +749,12 @@ pub fn build_from_proto<'a>(
+                 let in_val_id = get_val_id(&op.input_val);
+                 let val_receiver = valmap.get_receiver(in_val_id, builder);
+                 let mut vals = ValsWrScan::new(val_receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.vals.push(ValOutput {
++                        label: op.label.clone(),
++                        vals: vals.out_val.clone(),
++                    });
++                }
+                 if let Some(hbm) = hbm_ctx_opt.as_mut() {
+                     let (wr_addr_snd, wr_addr_rcv) = builder.unbounded::<ParAddrs>();
+                     let (wr_resp_snd, wr_resp_rcv) = builder.unbounded::<u64>();
+@@ -817,6 +875,28 @@ pub fn parse_proto<'a>(
+     builder
+ }
+ 
++/// parse_proto, also returning shared references to every writer's arrays.
++pub fn parse_proto_with_outputs<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++) -> (ProgramBuilder<'a>, WriterOutputs) {
++    let mut builder = ProgramBuilder::default();
++    let mut outputs = WriterOutputs::default();
++    build_from_proto_impl(
++        comal_graph,
++        base_path,
++        sam_options,
++        &mut builder,
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        Some(&mut outputs),
++    );
++    (builder, outputs)
++}
++
+ // ============================================================================
+ // Block Sparse Mode Functions
+ // ============================================================================

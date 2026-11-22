@@ -1,0 +1,394 @@
+From a1bf5e1e5bec5f2dc5ac11943d9308246b9744bf Mon Sep 17 00:00:00 2001
+From: v3 <v3@local>
+Date: Mon, 12 Oct 2026 23:29:51 +0800
+Subject: [PATCH] 0021-comal-true-block-outputs
+
+---
+ src/lib.rs              |  96 +++++++++++++++++++++++
+ src/proto_driver/mod.rs | 165 ++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 256 insertions(+), 5 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index cdd8706..8d12508 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,6 +9,8 @@ use prost::Message;
+ use proto_driver::{
+     parse_proto, parse_proto_with_outputs, parse_proto_block16, parse_proto_block32, parse_proto_block64,
+     parse_proto_true_block16, parse_proto_true_block32, parse_proto_true_block64,
++    parse_proto_true_block16_with_outputs, parse_proto_true_block32_with_outputs,
++    parse_proto_true_block64_with_outputs, BlockWriterOutputs,
+     proto_headers::tortilla::ComalGraph
+ };
+ 
+@@ -81,6 +83,97 @@ fn run_graph_outputs(
+     Ok((passed, cycles, fibers, vals))
+ }
+ 
++
++/// 0021: converts a true-block run's writer arrays to the run_graph_outputs format.
++fn block_outputs<V>(
++    passed: bool,
++    cycles: u64,
++    outputs: BlockWriterOutputs<V>,
++    flatten: impl Fn(&V) -> Vec<f32>,
++) -> (bool, u64, Vec<FiberArrays>, Vec<ValArrays>) {
++    let fibers = outputs
++        .fibers
++        .into_iter()
++        .map(|f| {
++            let seg = f.seg.lock().unwrap().clone();
++            let crd = f.crd.lock().unwrap().clone();
++            (f.tensor, f.index, f.format, seg, crd)
++        })
++        .collect();
++    let vals = outputs
++        .vals
++        .into_iter()
++        .map(|v| {
++            let values: Vec<f32> = v.vals.lock().unwrap().iter().flat_map(|b| flatten(b)).collect();
++            (v.label, values)
++        })
++        .collect();
++    (passed, cycles, fibers, vals)
++}
++
++/// 0021: like run_graph_true_block16, and also returns what every writer stored: (passed, cycles,
++/// fibers, vals) as run_graph_outputs, with each stored block flattened row-major (16 x 16 values).
++#[pyfunction]
++fn run_graph_true_block16_outputs(
++    proto: String,
++    data: String,
++) -> PyResult<(bool, u64, Vec<FiberArrays>, Vec<ValArrays>)> {
++    let comal_graph = {
++        let file_contents = fs::read(proto).unwrap();
++        ComalGraph::decode(file_contents.as_slice()).unwrap()
++    };
++    let (program_builder, outputs) =
++        parse_proto_true_block16_with_outputs(comal_graph, data.into(), Default::default());
++    let initialized = program_builder.initialize(Default::default()).unwrap();
++    let executed = initialized.run(Default::default());
++    let cycles = executed.elapsed_cycles().unwrap();
++    let passed = executed.passed();
++    println!("Elapsed Cycles (true_block16): {}", cycles);
++    Ok(block_outputs(passed, cycles, outputs, |t| t.data.iter().cloned().collect()))
++}
++
++/// 0021: like run_graph_true_block32, and also returns what every writer stored: (passed, cycles,
++/// fibers, vals) as run_graph_outputs, with each stored block flattened row-major (32 x 32 values).
++#[pyfunction]
++fn run_graph_true_block32_outputs(
++    proto: String,
++    data: String,
++) -> PyResult<(bool, u64, Vec<FiberArrays>, Vec<ValArrays>)> {
++    let comal_graph = {
++        let file_contents = fs::read(proto).unwrap();
++        ComalGraph::decode(file_contents.as_slice()).unwrap()
++    };
++    let (program_builder, outputs) =
++        parse_proto_true_block32_with_outputs(comal_graph, data.into(), Default::default());
++    let initialized = program_builder.initialize(Default::default()).unwrap();
++    let executed = initialized.run(Default::default());
++    let cycles = executed.elapsed_cycles().unwrap();
++    let passed = executed.passed();
++    println!("Elapsed Cycles (true_block32): {}", cycles);
++    Ok(block_outputs(passed, cycles, outputs, |t| t.data.iter().cloned().collect()))
++}
++
++/// 0021: like run_graph_true_block64, and also returns what every writer stored: (passed, cycles,
++/// fibers, vals) as run_graph_outputs, with each stored block flattened row-major (64 x 64 values).
++#[pyfunction]
++fn run_graph_true_block64_outputs(
++    proto: String,
++    data: String,
++) -> PyResult<(bool, u64, Vec<FiberArrays>, Vec<ValArrays>)> {
++    let comal_graph = {
++        let file_contents = fs::read(proto).unwrap();
++        ComalGraph::decode(file_contents.as_slice()).unwrap()
++    };
++    let (program_builder, outputs) =
++        parse_proto_true_block64_with_outputs(comal_graph, data.into(), Default::default());
++    let initialized = program_builder.initialize(Default::default()).unwrap();
++    let executed = initialized.run(Default::default());
++    let cycles = executed.elapsed_cycles().unwrap();
++    let passed = executed.passed();
++    println!("Elapsed Cycles (true_block64): {}", cycles);
++    Ok(block_outputs(passed, cycles, outputs, |t| t.data.iter().cloned().collect()))
++}
++
+ /// Runs proto graph with block_size=16 (for block sparse mode)
+ #[pyfunction]
+ fn run_graph_block16(proto: String, data: String) -> PyResult<(bool, u64)> {
+@@ -194,6 +287,9 @@ fn run_graph_true_block64(proto: String, data: String) -> PyResult<(bool, u64)>
+ fn comal(py: Python, m: &PyModule) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(run_graph, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_outputs, m)?)?;
++    m.add_function(wrap_pyfunction!(run_graph_true_block16_outputs, m)?)?;
++    m.add_function(wrap_pyfunction!(run_graph_true_block32_outputs, m)?)?;
++    m.add_function(wrap_pyfunction!(run_graph_true_block64_outputs, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block16, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block32, m)?)?;
+     m.add_function(wrap_pyfunction!(run_graph_block64, m)?)?;
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 6f52915..744864c 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -148,6 +148,24 @@ pub struct WriterOutputs {
+     pub vals: Vec<ValOutput>,
+ }
+ 
++/// 0021: values filled by one ValWrite of a true-block run (one N x N block per stored value).
++pub struct BlockValOutput<V> {
++    pub label: String,
++    pub vals: Arc<Mutex<Vec<V>>>,
++}
++
++/// 0021: every writer of a true-block graph, in the order the operators appear in the proto.
++pub struct BlockWriterOutputs<V> {
++    pub fibers: Vec<FiberOutput>,
++    pub vals: Vec<BlockValOutput<V>>,
++}
++
++impl<V> Default for BlockWriterOutputs<V> {
++    fn default() -> Self {
++        BlockWriterOutputs { fibers: Vec::new(), vals: Vec::new() }
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn build_from_proto<'a>(
+     comal_graph: ComalGraph,
+@@ -1561,6 +1579,28 @@ pub fn build_from_proto_parameterized<'a>(
+ 
+ use super::templates::primitive::FinalReduce;
+ 
++/// 0021: parse_proto_true_block16, also returning shared references to every writer's arrays.
++pub fn parse_proto_true_block16_with_outputs<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++) -> (ProgramBuilder<'a>, BlockWriterOutputs<VT16>) {
++    let mut builder = ProgramBuilder::default();
++    let mut outputs = BlockWriterOutputs::default();
++    build_from_proto_block16_impl(
++        comal_graph,
++        base_path,
++        sam_options,
++        &mut builder,
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        Some(&mut outputs),
++    );
++    (builder, outputs)
++}
++
+ /// Parse proto graph with TRUE block size 16 (16x16 dense blocks)
+ pub fn parse_proto_true_block16<'a>(
+     comal_graph: ComalGraph,
+@@ -1581,6 +1621,28 @@ pub fn parse_proto_true_block16<'a>(
+     builder
+ }
+ 
++/// 0021: parse_proto_true_block32, also returning shared references to every writer's arrays.
++pub fn parse_proto_true_block32_with_outputs<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++) -> (ProgramBuilder<'a>, BlockWriterOutputs<VT32>) {
++    let mut builder = ProgramBuilder::default();
++    let mut outputs = BlockWriterOutputs::default();
++    build_from_proto_block32_impl(
++        comal_graph,
++        base_path,
++        sam_options,
++        &mut builder,
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        Some(&mut outputs),
++    );
++    (builder, outputs)
++}
++
+ /// Parse proto graph with TRUE block size 32 (32x32 dense blocks)
+ pub fn parse_proto_true_block32<'a>(
+     comal_graph: ComalGraph,
+@@ -1601,6 +1663,28 @@ pub fn parse_proto_true_block32<'a>(
+     builder
+ }
+ 
++/// 0021: parse_proto_true_block64, also returning shared references to every writer's arrays.
++pub fn parse_proto_true_block64_with_outputs<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++) -> (ProgramBuilder<'a>, BlockWriterOutputs<VT64>) {
++    let mut builder = ProgramBuilder::default();
++    let mut outputs = BlockWriterOutputs::default();
++    build_from_proto_block64_impl(
++        comal_graph,
++        base_path,
++        sam_options,
++        &mut builder,
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        &mut Default::default(),
++        Some(&mut outputs),
++    );
++    (builder, outputs)
++}
++
+ /// Parse proto graph with TRUE block size 64 (64x64 dense blocks)
+ pub fn parse_proto_true_block64<'a>(
+     comal_graph: ComalGraph,
+@@ -1632,6 +1716,22 @@ pub fn build_from_proto_block16<'a>(
+     crdmap: &mut Channels<'a, Token<CT, ST>>,
+     valmap: &mut Channels<'a, Token<VT16, ST>>,
+     repmap: &mut Channels<'a, Repsiggen>,
++) {
++    build_from_proto_block16_impl(comal_graph, base_path, sam_options, builder, refmap, crdmap, valmap, repmap, None);
++}
++
++/// 0021: build_from_proto_block16, additionally recording the writers' arrays in `outputs` if given.
++#[allow(clippy::too_many_arguments)]
++fn build_from_proto_block16_impl<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++    builder: &mut ProgramBuilder<'a>,
++    refmap: &mut Channels<'a, Token<CT, ST>>,
++    crdmap: &mut Channels<'a, Token<CT, ST>>,
++    valmap: &mut Channels<'a, Token<VT16, ST>>,
++    repmap: &mut Channels<'a, Repsiggen>,
++    mut outputs: Option<&mut BlockWriterOutputs<VT16>>,
+ ) {
+     const N: usize = 16;
+ 
+@@ -1752,6 +1852,9 @@ pub fn build_from_proto_block16<'a>(
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let receiver = crdmap.get_receiver(in_crd_id, builder);
+                 let wr = CompressedWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.fibers.push(FiberOutput { tensor: op.tensor.clone(), index: op.index.clone(), format: op.format.clone(), seg: wr.seg_arr.clone(), crd: wr.crd_arr.clone() });
++                }
+                 builder.add_child(wr);
+             }
+             Op::Repeat(op) => {
+@@ -2010,7 +2113,11 @@ pub fn build_from_proto_block16<'a>(
+             Op::ValWrite(op) => {
+                 let in_val_id = get_val_id(&op.input_val);
+                 let val_receiver = valmap.get_receiver(in_val_id, builder);
+-                builder.add_child(ValsWrScan::new(val_receiver));
++                let vals = ValsWrScan::new(val_receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.vals.push(BlockValOutput { label: op.label.clone(), vals: vals.out_val.clone() });
++                }
++                builder.add_child(vals);
+             }
+             Op::Root(op) => {
+                 let out_ref_id = get_ref_id(&op.output_ref);
+@@ -2123,6 +2230,22 @@ pub fn build_from_proto_block32<'a>(
+     crdmap: &mut Channels<'a, Token<CT, ST>>,
+     valmap: &mut Channels<'a, Token<VT32, ST>>,
+     repmap: &mut Channels<'a, Repsiggen>,
++) {
++    build_from_proto_block32_impl(comal_graph, base_path, sam_options, builder, refmap, crdmap, valmap, repmap, None);
++}
++
++/// 0021: build_from_proto_block32, additionally recording the writers' arrays in `outputs` if given.
++#[allow(clippy::too_many_arguments)]
++fn build_from_proto_block32_impl<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++    builder: &mut ProgramBuilder<'a>,
++    refmap: &mut Channels<'a, Token<CT, ST>>,
++    crdmap: &mut Channels<'a, Token<CT, ST>>,
++    valmap: &mut Channels<'a, Token<VT32, ST>>,
++    repmap: &mut Channels<'a, Repsiggen>,
++    mut outputs: Option<&mut BlockWriterOutputs<VT32>>,
+ ) {
+     const N: usize = 32;
+ 
+@@ -2201,7 +2324,11 @@ pub fn build_from_proto_block32<'a>(
+             }
+             Op::FiberWrite(op) => {
+                 let receiver = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+-                builder.add_child(CompressedWrScan::new(receiver));
++                let wr = CompressedWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.fibers.push(FiberOutput { tensor: op.tensor.clone(), index: op.index.clone(), format: op.format.clone(), seg: wr.seg_arr.clone(), crd: wr.crd_arr.clone() });
++                }
++                builder.add_child(wr);
+             }
+             Op::Repeat(op) => {
+                 let (out_repsig, in_repsig) = builder.bounded(DEFAULT_CHAN_SIZE);
+@@ -2340,7 +2467,11 @@ pub fn build_from_proto_block32<'a>(
+             }
+             Op::ValWrite(op) => {
+                 let val_receiver = valmap.get_receiver(get_val_id(&op.input_val), builder);
+-                builder.add_child(ValsWrScan::new(val_receiver));
++                let vals = ValsWrScan::new(val_receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.vals.push(BlockValOutput { label: op.label.clone(), vals: vals.out_val.clone() });
++                }
++                builder.add_child(vals);
+             }
+             Op::Root(op) => {
+                 let root_sender = refmap.get_sender(get_ref_id(&op.output_ref), builder);
+@@ -2413,6 +2544,22 @@ pub fn build_from_proto_block64<'a>(
+     crdmap: &mut Channels<'a, Token<CT, ST>>,
+     valmap: &mut Channels<'a, Token<VT64, ST>>,
+     repmap: &mut Channels<'a, Repsiggen>,
++) {
++    build_from_proto_block64_impl(comal_graph, base_path, sam_options, builder, refmap, crdmap, valmap, repmap, None);
++}
++
++/// 0021: build_from_proto_block64, additionally recording the writers' arrays in `outputs` if given.
++#[allow(clippy::too_many_arguments)]
++fn build_from_proto_block64_impl<'a>(
++    comal_graph: ComalGraph,
++    base_path: PathBuf,
++    sam_options: SamOptions,
++    builder: &mut ProgramBuilder<'a>,
++    refmap: &mut Channels<'a, Token<CT, ST>>,
++    crdmap: &mut Channels<'a, Token<CT, ST>>,
++    valmap: &mut Channels<'a, Token<VT64, ST>>,
++    repmap: &mut Channels<'a, Repsiggen>,
++    mut outputs: Option<&mut BlockWriterOutputs<VT64>>,
+ ) {
+     const N: usize = 64;
+ 
+@@ -2438,7 +2585,11 @@ pub fn build_from_proto_block64<'a>(
+             }
+             Op::FiberWrite(op) => {
+                 let receiver = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+-                builder.add_child(CompressedWrScan::new(receiver));
++                let wr = CompressedWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.fibers.push(FiberOutput { tensor: op.tensor.clone(), index: op.index.clone(), format: op.format.clone(), seg: wr.seg_arr.clone(), crd: wr.crd_arr.clone() });
++                }
++                builder.add_child(wr);
+             }
+             Op::Repeat(op) => {
+                 let (out_repsig, in_repsig) = builder.bounded(DEFAULT_CHAN_SIZE);
+@@ -2565,7 +2716,11 @@ pub fn build_from_proto_block64<'a>(
+             }
+             Op::ValWrite(op) => {
+                 let receiver = valmap.get_receiver(get_val_id(&op.input_val), builder);
+-                builder.add_child(ValsWrScan::new(receiver));
++                let vals = ValsWrScan::new(receiver);
++                if let Some(out) = outputs.as_deref_mut() {
++                    out.vals.push(BlockValOutput { label: op.label.clone(), vals: vals.out_val.clone() });
++                }
++                builder.add_child(vals);
+             }
+             Op::Root(op) => {
+                 let sender = refmap.get_sender(get_ref_id(&op.output_ref), builder);
+-- 
+2.43.0
+

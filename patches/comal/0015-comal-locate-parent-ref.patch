@@ -1,0 +1,361 @@
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 7450162..ddc701d 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -677,13 +677,22 @@ fn build_from_proto_impl<'a>(
+                 let out_ref1_id = get_ref_id(&op.output_ref1);
+                 let out_ref2_id = get_ref_id(&op.output_ref2);
+                 let out_crd_id = get_crd_id(&op.output_crd);
+-                let locate = IterateLocate::new(
++                let mut locate = IterateLocate::new(
+                     refmap.get_receiver(in_ref_id, builder),
+                     crdmap.get_receiver(in_crd_id, builder),
+                     refmap.get_sender(out_ref1_id, builder),
+                     refmap.get_sender(out_ref2_id, builder),
+                     crdmap.get_sender(out_crd_id, builder),
+                 );
++                if op.parent_ref.is_some() {
++                    // The located level's extent, read the way UncompressedCrdRdScan reads it
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(
++                        refmap.get_receiver(get_ref_id(&op.parent_ref), builder),
++                        shapes[op.mode as usize],
++                    );
++                }
+                 builder.add_child(locate);
+             }
+             Op::Array(op) => {
+@@ -1521,6 +1530,7 @@ pub fn build_from_proto_parameterized<'a>(
+                 }
+             },
+             Op::Locate(op) => {
++                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_id = get_ref_id(&op.input_ref);
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let out_ref1_id = get_ref_id(&op.output_ref1);
+@@ -2072,6 +2082,7 @@ pub fn build_from_proto_block16<'a>(
+                 }
+             },
+             Op::Locate(op) => {
++                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_id = get_ref_id(&op.input_ref);
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let out_ref1_id = get_ref_id(&op.output_ref1);
+@@ -2358,6 +2369,7 @@ pub fn build_from_proto_block32<'a>(
+                 join::Conn::Repsig(_) => panic!("join repsig"),
+             },
+             Op::Locate(op) => {
++                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_r = refmap.get_receiver(get_ref_id(&op.input_ref), builder);
+                 let in_crd_r = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+                 let out_ref1 = refmap.get_sender(get_ref_id(&op.output_ref1), builder);
+@@ -2542,6 +2554,7 @@ pub fn build_from_proto_block64<'a>(
+                 join::Conn::Repsig(_) => panic!("join repsig"),
+             },
+             Op::Locate(op) => {
++                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let input_ref = refmap.get_receiver(get_ref_id(&op.input_ref), builder);
+                 let input_crd = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+                 let output_ref1 = refmap.get_sender(get_ref_id(&op.output_ref1), builder);
+diff --git a/src/templates/locate.rs b/src/templates/locate.rs
+index e81b3ec..a5d4d6b 100644
+--- a/src/templates/locate.rs
++++ b/src/templates/locate.rs
+@@ -15,6 +15,9 @@ pub struct IterateLocate<ValType: Clone, StopType: Clone> {
+     pub out_ref1: Sender<Token<ValType, StopType>>,
+     pub out_ref2: Sender<Token<ValType, StopType>>,
+     pub out_crd: Sender<Token<ValType, StopType>>,
++    // Set when the located level is not the tensor's first: the references of the level above,
++    // one per located fiber, and the located level's extent
++    pub parent: Option<(Receiver<Token<ValType, StopType>>, ValType)>,
+ }
+ 
+ impl<ValType: DAMType, StopType: DAMType> IterateLocate<ValType, StopType>
+@@ -34,6 +37,7 @@ where
+             out_ref1,
+             out_ref2,
+             out_crd,
++            parent: None,
+             context_info: Default::default(),
+         };
+         (loc.in_ref).attach_receiver(&loc);
+@@ -44,16 +48,27 @@ where
+ 
+         loc
+     }
++
++    pub fn set_parent(&mut self, parent_ref: Receiver<Token<ValType, StopType>>, extent: ValType) {
++        parent_ref.attach_receiver(&*self);
++        self.parent = Some((parent_ref, extent));
++    }
+ }
+ 
+ impl<ValType, StopType> Context for IterateLocate<ValType, StopType>
+ where
+-    ValType: DAMType + std::cmp::PartialEq,
++    ValType: DAMType
++        + std::cmp::PartialEq
++        + std::ops::Mul<Output = ValType>
++        + std::ops::Add<Output = ValType>,
+     StopType: DAMType + std::ops::Add<u32, Output = StopType> + std::cmp::PartialEq,
+ {
+     fn init(&mut self) {}
+ 
+     fn run(&mut self) {
++        if self.parent.is_some() {
++            return self.run_with_parent();
++        }
+         let id = Identifier { id: 0 };
+         let curr_id = self.id();
+         loop {
+@@ -92,3 +107,87 @@ where
+         }
+     }
+ }
++
++impl<ValType, StopType> IterateLocate<ValType, StopType>
++where
++    ValType: DAMType
++        + std::cmp::PartialEq
++        + std::ops::Mul<Output = ValType>
++        + std::ops::Add<Output = ValType>,
++    StopType: DAMType + std::ops::Add<u32, Output = StopType> + std::cmp::PartialEq,
++    IterateLocate<ValType, StopType>: Context,
++{
++    /// The located reference is parent reference * extent + coordinate, which is what
++    /// UncompressedCrdRdScan gives for the same level. One parent token is consumed per located
++    /// fiber, the way that scanner consumes its input: a fiber closed by Stop(s) with s > 0 also
++    /// consumes the parent's Stop(s - 1); a parent Stop(t) between fibers is the child's Stop(t + 1).
++    /// Any other pairing of the two streams is a malformed graph and panics.
++    fn run_with_parent(&mut self) {
++        let (parent, extent) = self.parent.take().unwrap();
++        let mut current: Option<ValType> = None;
++        // a fiber closed by Stop(s), s > 0, also closes the parent's fiber with Stop(s - 1)
++        macro_rules! close {
++            ($s:expr) => {
++                if $s != StopType::default() {
++                    match parent.dequeue(&self.time).unwrap().data {
++                        Token::Stop(t) if t.clone() + 1 == $s => {}
++                        other => panic!("locate: fiber closed by stop {:?}, parent gave {:?}", $s, other),
++                    }
++                }
++            };
++        }
++        loop {
++            let in_ref = self.in_ref.dequeue(&self.time).unwrap().data;
++            let in_crd = self.in_crd.dequeue(&self.time).unwrap().data;
++            let ref1 = match in_crd.clone() {
++                Token::Val(c) => {
++                    if current.is_none() {
++                        match parent.dequeue(&self.time).unwrap().data {
++                            Token::Val(p) => current = Some(p),
++                            other => panic!("locate: coordinate {:?}, parent gave {:?}", c, other),
++                        }
++                    }
++                    Token::Val(current.clone().unwrap() * extent.clone() + c)
++                }
++                Token::Stop(s) => {
++                    if current.is_none() {
++                        // a fiber without coordinates, or a stop between fibers
++                        match parent.dequeue(&self.time).unwrap().data {
++                            Token::Val(_) => close!(s.clone()),
++                            Token::Stop(t) if t.clone() + 1 == s => {}
++                            other => panic!("locate: stop {:?} between fibers, parent gave {:?}", s, other),
++                        }
++                    } else {
++                        close!(s.clone());
++                    }
++                    current = None;
++                    Token::Stop(s)
++                }
++                Token::Empty | Token::Done => {
++                    if current.is_some() {
++                        panic!("locate: {:?} inside a located fiber", in_crd);
++                    }
++                    let p = parent.dequeue(&self.time).unwrap().data;
++                    if p != in_crd {
++                        panic!("locate: coordinate stream gave {:?}, parent gave {:?}", in_crd, p);
++                    }
++                    in_crd.clone()
++                }
++            };
++            self.out_ref1
++                .enqueue(&self.time, ChannelElement::new(self.time.tick() + 1, ref1))
++                .unwrap();
++            self.out_ref2
++                .enqueue(&self.time, ChannelElement::new(self.time.tick() + 1, in_ref.clone()))
++                .unwrap();
++            self.out_crd
++                .enqueue(&self.time, ChannelElement::new(self.time.tick() + 1, in_crd.clone()))
++                .unwrap();
++            if in_ref == Token::Done {
++                return;
++            }
++            self.time.incr_cycles(1);
++        }
++    }
++}
++
+diff --git a/tests/locate_parent.rs b/tests/locate_parent.rs
+new file mode 100755
+index 0000000..ea3820f
+--- /dev/null
++++ b/tests/locate_parent.rs
+@@ -0,0 +1,140 @@
++// Tests of the locate fix: a located level that is not the tensor's first gets the parent reference.
++use comal::proto_driver::parse_proto_with_outputs;
++use comal::proto_driver::proto_headers::tortilla::*;
++use comal::templates::locate::IterateLocate;
++use comal::templates::primitive::Token;
++use comal::token_vec;
++use dam::simulation::*;
++use dam::utility_contexts::{CheckerContext, GeneratorContext};
++use std::fs;
++
++type T = Token<u32, u32>;
++
++fn locate_test(
++    in_ref: fn() -> std::vec::IntoIter<T>,
++    in_crd: fn() -> std::vec::IntoIter<T>,
++    parent: Option<(fn() -> std::vec::IntoIter<T>, u32)>,
++    out_ref1: fn() -> std::vec::IntoIter<T>,
++) {
++    let mut ctx = ProgramBuilder::default();
++    let (in_ref_s, in_ref_r) = ctx.unbounded::<T>();
++    let (in_crd_s, in_crd_r) = ctx.unbounded::<T>();
++    let (r1_s, r1_r) = ctx.unbounded::<T>();
++    let (r2_s, r2_r) = ctx.unbounded::<T>();
++    let (crd_s, crd_r) = ctx.unbounded::<T>();
++    let mut loc = IterateLocate::new(in_ref_r, in_crd_r, r1_s, r2_s, crd_s);
++    if let Some((p, extent)) = parent {
++        let (p_s, p_r) = ctx.unbounded::<T>();
++        loc.set_parent(p_r, extent);
++        ctx.add_child(GeneratorContext::new(p, p_s));
++    }
++    ctx.add_child(GeneratorContext::new(in_ref, in_ref_s));
++    ctx.add_child(GeneratorContext::new(in_crd, in_crd_s));
++    ctx.add_child(CheckerContext::new(out_ref1, r1_r));
++    ctx.add_child(CheckerContext::new(in_ref, r2_r));
++    ctx.add_child(CheckerContext::new(in_crd, crd_r));
++    ctx.add_child(loc);
++    ctx.initialize(InitializationOptions::default()).unwrap().run(RunOptions::default());
++}
++
++#[test]
++fn locate_first_level_unchanged() {
++    // no parent: the located reference is the coordinate, as before the fix
++    locate_test(
++        || token_vec!(u32; u32; 10, 11, "S0", 12, "S1", "D").into_iter(),
++        || token_vec!(u32; u32; 1, 3, "S0", 2, "S1", "D").into_iter(),
++        None,
++        || token_vec!(u32; u32; 1, 3, "S0", 2, "S1", "D").into_iter(),
++    );
++}
++
++#[test]
++fn locate_second_level_with_empty_fiber() {
++    // a 3x4 dense tensor, rows 0, 1, 2; row 1 locates nothing
++    locate_test(
++        || token_vec!(u32; u32; 10, 11, "S0", "S0", 12, 13, 14, "S1", "D").into_iter(),
++        || token_vec!(u32; u32; 1, 3, "S0", "S0", 0, 2, 3, "S1", "D").into_iter(),
++        Some((|| token_vec!(u32; u32; 0, 1, 2, "S0", "D").into_iter(), 4)),
++        || token_vec!(u32; u32; 1, 3, "S0", "S0", 8, 10, 11, "S1", "D").into_iter(),
++    );
++}
++
++#[test]
++fn locate_second_level_nested_stops() {
++    // parent fibers [0, 1] and [2]; the child's S1 and S2 consume the parent's S0 and S1
++    locate_test(
++        || token_vec!(u32; u32; 10, "S0", 11, "S1", 12, "S2", "D").into_iter(),
++        || token_vec!(u32; u32; 1, "S0", 2, "S1", 3, "S2", "D").into_iter(),
++        Some((|| token_vec!(u32; u32; 0, 1, "S0", 2, "S1", "D").into_iter(), 4)),
++        || token_vec!(u32; u32; 1, "S0", 6, "S1", 11, "S2", "D").into_iter(),
++    );
++}
++
++fn r(id: u64) -> Option<RefStream> { Some(RefStream { id: Some(ref_stream::StreamId { id }), name: String::new() }) }
++fn c(id: u64) -> Option<CrdStream> { Some(CrdStream { id: Some(crd_stream::StreamId { id }), name: String::new() }) }
++fn v(id: u64) -> Option<ValStream> { Some(ValStream { id: Some(val_stream::StreamId { id }), name: String::new() }) }
++fn op(id: u64, o: operation::Op) -> Operation { Operation { name: String::new(), id, op: Some(o) } }
++
++/// The shape of the V1 `n1` program: rows i of a dense 3x4 M, W (4x2, rows 1 and 3 stored) repeated
++/// per row, M's second level located at W's row coordinates k. Returns the M values read, in order.
++fn dense_times_sparse(dir: &str, with_parent: bool) -> Vec<f32> {
++    fs::create_dir_all(dir).unwrap();
++    for (name, s) in [
++        ("tensor_M_mode_shape", "3\n4\n"),
++        ("tensor_M_mode_vals", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n"),
++        ("tensor_W_mode_shape", "4\n2\n"),
++        ("tensor_W_mode_0_seg", "0\n2\n"),
++        ("tensor_W_mode_0_crd", "1\n3\n"),
++        ("tensor_W_mode_1_seg", "0\n1\n2\n"),
++        ("tensor_W_mode_1_crd", "0\n1\n"),
++        ("tensor_W_mode_vals", "0.5\n2\n"),
++    ] {
++        fs::write(format!("{dir}/{name}"), s).unwrap();
++    }
++    let locate = Locate {
++        input_crd: c(13), input_ref: r(12), output_ref1: r(14), output_ref2: r(15), output_crd: c(16),
++        parent_ref: if with_parent { r(21) } else { None },
++        tensor: if with_parent { "M".into() } else { String::new() },
++        mode: 1,
++        ..Default::default()
++    };
++    let mut ops = vec![
++        op(1, operation::Op::Root(Generator { output_ref: r(1), ..Default::default() })),
++        op(2, operation::Op::FiberLookup(FiberLookup { input_ref: r(1), output_ref: r(2), output_crd: c(3),
++            tensor: "M".into(), mode: 0, format: "dense".into(), ..Default::default() })),
++        op(4, operation::Op::Root(Generator { output_ref: r(10), ..Default::default() })),
++        op(5, operation::Op::Repeat(Repeat { input_ref: Some(repeat::InputRef::InRef(r(10).unwrap())),
++            output_ref: Some(repeat::OutputRef::OutRef(r(11).unwrap())),
++            input_rep_sig: Some(repeat::InputRepSig::RepRef(r(20).unwrap())), ..Default::default() })),
++        op(6, operation::Op::FiberLookup(FiberLookup { input_ref: r(11), output_ref: r(12), output_crd: c(13),
++            tensor: "W".into(), mode: 0, format: "compressed".into(), ..Default::default() })),
++        op(7, operation::Op::Locate(locate)),
++        op(8, operation::Op::Array(ArrayVals { tensor: "M".into(), input_ref: r(14), output_val: v(17), ..Default::default() })),
++        op(9, operation::Op::Array(ArrayVals { tensor: "W".into(), input_ref: r(15), output_val: v(18), ..Default::default() })),
++        op(10, operation::Op::ValWrite(ValWrite { input_val: v(17), label: "m".into(), ..Default::default() })),
++        op(11, operation::Op::ValWrite(ValWrite { input_val: v(18), label: "w".into(), ..Default::default() })),
++        op(12, operation::Op::FiberWrite(FiberWrite { input_crd: c(3), tensor: "X".into(), index: "d0".into(), format: "dense".into(), ..Default::default() })),
++        op(13, operation::Op::FiberWrite(FiberWrite { input_crd: c(16), tensor: "X".into(), index: "d1".into(), format: "compressed".into(), ..Default::default() })),
++    ];
++    // M's row references feed the repeat signal and, with the fix, the locate's parent input
++    let targets = if with_parent { vec![r(20).unwrap(), r(21).unwrap()] } else { vec![r(20).unwrap()] };
++    ops.push(op(3, operation::Op::Broadcast(Broadcast { conn: Some(broadcast::Conn::Ref(broadcast::RefBundle {
++        input: r(2), outputs: targets })), ..Default::default() })));
++    let graph = ComalGraph { name: "t".into(), channel_size: 1024, graph: Some(ProgramGraph { name: "t".into(), operators: ops }) };
++    let (builder, outputs) = parse_proto_with_outputs(graph, dir.into(), Default::default());
++    let executed = builder.initialize(Default::default()).unwrap().run(Default::default());
++    println!("{dir}: parent={with_parent} passed={} cycles={}", executed.passed(), executed.elapsed_cycles().unwrap());
++    let m = outputs.vals.iter().find(|x| x.label == "m").unwrap().vals.lock().unwrap().clone();
++    let w = outputs.vals.iter().find(|x| x.label == "w").unwrap().vals.lock().unwrap().clone();
++    println!("  M values {:?}, W values {:?}", m, w);
++    assert_eq!(w, vec![0.5, 2.0, 0.5, 2.0, 0.5, 2.0]);
++    m
++}
++
++#[test]
++fn locate_second_level_through_driver() {
++    std::env::set_var("COMAL_ENABLE_HBM", "0");
++    // without the parent reference every row reads row 0 (the V1 bug); with it, M[i, k]
++    assert_eq!(dense_times_sparse("/tmp/ffcheck_locate_old", false), vec![2.0, 4.0, 2.0, 4.0, 2.0, 4.0]);
++    assert_eq!(dense_times_sparse("/tmp/ffcheck_locate_new", true), vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]);
++}
+diff --git a/tortilla/proto/ops.proto b/tortilla/proto/ops.proto
+index 2ee2881..14c1b55 100644
+--- a/tortilla/proto/ops.proto
++++ b/tortilla/proto/ops.proto
+@@ -257,6 +257,11 @@ message Locate {
+   RefStream output_ref2 = 4;
+   CrdStream output_crd = 5;
+   string label = 6;
++  // Set when the located level is not the tensor's first: the references of the level above
++  // (one per located fiber) and the tensor/mode whose shape file gives the located level's extent
++  RefStream parent_ref = 7;
++  string tensor = 8;
++  uint64 mode = 9;
+ }
+ 
+ message CoordDrop {

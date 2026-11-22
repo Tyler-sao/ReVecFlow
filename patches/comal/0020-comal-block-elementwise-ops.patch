@@ -1,0 +1,88 @@
+From 566352a94d9a97fcc4bdbe69edfbbc0f4036fce2 Mon Sep 17 00:00:00 2001
+From: v3 <v3@local>
+Date: Mon, 12 Oct 2026 23:28:33 +0800
+Subject: [PATCH] 0020-comal-block-elementwise-ops
+
+---
+ src/proto_driver/mod.rs | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index ddc701d..6f52915 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -1875,6 +1875,8 @@ pub fn build_from_proto_block16<'a>(
+                             1,
+                             |val1: VT16, val2: VT16| -> VT16 { val1 * val2 }
+                         ),
++                        // 0020: element-wise division, timed like Add/Sub/Elemmul above
++                        alu::AluOp::Div => (N * N, 1, |val1: VT16, val2: VT16| -> VT16 { Tensor::new(&val1.data / &val2.data) }),
+                         _ => todo!("Unsupported binary op for block sparse"),
+                     };
+                     builder.add_child(Binary::new(
+@@ -1913,6 +1915,14 @@ pub fn build_from_proto_block16<'a>(
+                                 N,
+                             ));
+                         }
++                        // 0020: the scalar unary ops applied element-wise to a block, timed like Scalarmul/Scalaradd above (Unary, block size N)
++                        alu::AluOp::Exp => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| x.exp()).to_owned()) }, N)); }
++                        alu::AluOp::Sin => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| x.sin()).to_owned()) }, N)); }
++                        alu::AluOp::Cos => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| x.cos()).to_owned()) }, N)); }
++                        alu::AluOp::Max => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| x.max(scalar)).to_owned()) }, N)); }
++                        alu::AluOp::Scalardiv => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| x / scalar).to_owned()) }, N)); }
++                        alu::AluOp::Rsqrt => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| 1.0 / x.sqrt()).to_owned()) }, N)); }
++                        alu::AluOp::Sigmoid => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT16| -> VT16 { Tensor::new(val.data.map(|x| 1.0 / (1.0 + f32::exp(-x))).to_owned()) }, N)); }
+                         _ => todo!("Unsupported unary op for block sparse"),
+                     }
+                 }
+@@ -2257,6 +2267,8 @@ pub fn build_from_proto_block32<'a>(
+                         alu::AluOp::Add => (N * N, 1, |val1: VT32, val2: VT32| -> VT32 { val1 + val2 }),
+                         alu::AluOp::Sub => (N * N, 1, |val1: VT32, val2: VT32| -> VT32 { val1 - val2 }),
+                         alu::AluOp::Elemmul => (N * N, 1, |val1: VT32, val2: VT32| -> VT32 { val1 * val2 }),
++                        // 0020: element-wise division, timed like Add/Sub/Elemmul above
++                        alu::AluOp::Div => (N * N, 1, |val1: VT32, val2: VT32| -> VT32 { Tensor::new(&val1.data / &val2.data) }),
+                         _ => todo!("Unsupported binary op for block sparse"),
+                     };
+                     builder.add_child(Binary::new(val_receiver1, val_receiver2, out_val_sender, binary_func, N.try_into().unwrap(), latency.try_into().unwrap(), ii.try_into().unwrap()));
+@@ -2265,6 +2277,14 @@ pub fn build_from_proto_block32<'a>(
+                     match op.stages[0].op() {
+                         alu::AluOp::Scalarmul => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x * scalar).to_owned()) }, N)); }
+                         alu::AluOp::Scalaradd => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x + scalar).to_owned()) }, N)); }
++                        // 0020: the scalar unary ops applied element-wise to a block, timed like Scalarmul/Scalaradd above (Unary, block size N)
++                        alu::AluOp::Exp => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x.exp()).to_owned()) }, N)); }
++                        alu::AluOp::Sin => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x.sin()).to_owned()) }, N)); }
++                        alu::AluOp::Cos => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x.cos()).to_owned()) }, N)); }
++                        alu::AluOp::Max => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x.max(scalar)).to_owned()) }, N)); }
++                        alu::AluOp::Scalardiv => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| x / scalar).to_owned()) }, N)); }
++                        alu::AluOp::Rsqrt => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| 1.0 / x.sqrt()).to_owned()) }, N)); }
++                        alu::AluOp::Sigmoid => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT32| -> VT32 { Tensor::new(val.data.map(|x| 1.0 / (1.0 + f32::exp(-x))).to_owned()) }, N)); }
+                         _ => todo!("Unsupported unary op for block sparse"),
+                     }
+                 }
+@@ -2484,6 +2504,8 @@ pub fn build_from_proto_block64<'a>(
+                         alu::AluOp::Add => (N * N, 1, |val1: VT64, val2: VT64| -> VT64 { val1 + val2 }),
+                         alu::AluOp::Sub => (N * N, 1, |val1: VT64, val2: VT64| -> VT64 { val1 - val2 }),
+                         alu::AluOp::Elemmul => (N * N, 1, |val1: VT64, val2: VT64| -> VT64 { val1 * val2 }),
++                        // 0020: element-wise division, timed like Add/Sub/Elemmul above
++                        alu::AluOp::Div => (N * N, 1, |val1: VT64, val2: VT64| -> VT64 { Tensor::new(&val1.data / &val2.data) }),
+                         _ => todo!("Unsupported binary op for block sparse"),
+                     };
+                     builder.add_child(Binary::new(val_receiver1, val_receiver2, out_val_sender, binary_func, N.try_into().unwrap(), latency.try_into().unwrap(), ii.try_into().unwrap()));
+@@ -2492,6 +2514,14 @@ pub fn build_from_proto_block64<'a>(
+                     match op.stages[0].op() {
+                         alu::AluOp::Scalarmul => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x * scalar).to_owned()) }, N)); }
+                         alu::AluOp::Scalaradd => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x + scalar).to_owned()) }, N)); }
++                        // 0020: the scalar unary ops applied element-wise to a block, timed like Scalarmul/Scalaradd above (Unary, block size N)
++                        alu::AluOp::Exp => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x.exp()).to_owned()) }, N)); }
++                        alu::AluOp::Sin => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x.sin()).to_owned()) }, N)); }
++                        alu::AluOp::Cos => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x.cos()).to_owned()) }, N)); }
++                        alu::AluOp::Max => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x.max(scalar)).to_owned()) }, N)); }
++                        alu::AluOp::Scalardiv => { let scalar: f32 = op.scalar as f32; builder.add_child(Unary::new(val_receiver1, out_val_sender, move |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| x / scalar).to_owned()) }, N)); }
++                        alu::AluOp::Rsqrt => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| 1.0 / x.sqrt()).to_owned()) }, N)); }
++                        alu::AluOp::Sigmoid => { builder.add_child(Unary::new(val_receiver1, out_val_sender, |val: VT64| -> VT64 { Tensor::new(val.data.map(|x| 1.0 / (1.0 + f32::exp(-x))).to_owned()) }, N)); }
+                         _ => todo!("Unsupported unary op for block sparse"),
+                     }
+                 }
+-- 
+2.43.0
+

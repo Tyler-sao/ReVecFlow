@@ -1,0 +1,78 @@
+diff --git a/lib/Conversion/SparseToSam/InsertIterateLocate.cpp b/lib/Conversion/SparseToSam/InsertIterateLocate.cpp
+index e2ca546..7506e07 100644
+--- a/lib/Conversion/SparseToSam/InsertIterateLocate.cpp
++++ b/lib/Conversion/SparseToSam/InsertIterateLocate.cpp
+@@ -96,9 +96,16 @@ public:
+ //        llvm::outs() << "Type: " << out_refs[denseInputIdx].getType() << "\n";
+ //        llvm::outs() << "Type: " << out_refs[sparseInputIdx].getType() << "\n";
+ //        llvm::outs() << "Type: " << out_crd.getType() << "\n";
++        // Below the dense tensor's first level, the located position depends on the level above:
++        // pass the dense level scanner's own input references, one per located fiber
++        Value parentRef;
++        if (mlir::sam::getSamStreamEncoding(out_refs[denseInputIdx].getType()).getMode().getInt() > 0) {
++            parentRef = denseLs.getInputRef();
++        }
+         auto locateOp = rewriter.create<mlir::sam::SamLocate>(joinerOp->getLoc(), out_refs[denseInputIdx].getType(),
+                                                               out_refs[sparseInputIdx].getType(), out_crd.getType(),
+-                                                              sparseLs.getOutputCrd(), sparseLs.getOutputRef());
++                                                              sparseLs.getOutputCrd(), sparseLs.getOutputRef(),
++                                                              parentRef);
+ 
+         rewriter.replaceAllUsesWith(out_refs[denseInputIdx], locateOp.getOutputRef1());
+         rewriter.replaceAllUsesWith(out_refs[sparseInputIdx], locateOp.getOutputRef2());
+diff --git a/lib/Dialect/SAM/SamOps.td b/lib/Dialect/SAM/SamOps.td
+index 3f04fc0..b37dedc 100644
+--- a/lib/Dialect/SAM/SamOps.td
++++ b/lib/Dialect/SAM/SamOps.td
+@@ -37,7 +37,10 @@ def SamFiberLookup : SamOp<"fiber_lookup", [ Pure ]>
+ 
+ def SamLocate : SamOp<"locate", [ Pure ]>
+ {
+-    let arguments = (ins AnyRankedTensor : $input_crd, AnyRankedTensor : $input_ref);
++    // parent_ref: the references of the level above the located one, present when the located level
++    // is not the tensor's first (output_ref1 is then parent * extent + crd)
++    let arguments = (ins AnyRankedTensor : $input_crd, AnyRankedTensor : $input_ref,
++                         Optional<AnyRankedTensor> : $parent_ref);
+     let results = (outs AnyRankedTensor : $output_ref1, AnyRankedTensor : $output_ref2, AnyRankedTensor : $output_crd);
+     // let assemblyFormat = "$input_crd `:` type($input_crd) `,` $input_ref `:` type($input_ref) attr-dict `->`
+     // type($output_ref1) `,` type($output_ref2) `,` type($output_crd)";
+diff --git a/lib/Target/ProtoEmitter/ProtoEmitter.cpp b/lib/Target/ProtoEmitter/ProtoEmitter.cpp
+index cb80301..cfc82e6 100644
+--- a/lib/Target/ProtoEmitter/ProtoEmitter.cpp
++++ b/lib/Target/ProtoEmitter/ProtoEmitter.cpp
+@@ -753,6 +753,19 @@ namespace mlir::sam
+         new_op->mutable_locate()->mutable_output_crd()->mutable_id()->set_id(
+             channel_tracker.get_create_channel(output_crd));
+ 
++        // Located level below the tensor's first: the parent references, and the tensor/mode whose
++        // shape file gives the level's extent (named as for fiberlookup)
++        if (auto parent_ref = locateOp.getParentRef())
++        {
++            const SamStreamEncodingAttr enc = getSamStreamEncoding(output_ref1.getType());
++            std::string tensor = enc.getTensor().str();
++            new_op->mutable_locate()->set_tensor(tensor.substr(0, tensor.find('_')));
++            new_op->mutable_locate()->set_mode(enc.getMode().getInt());
++            new_op->mutable_locate()->mutable_parent_ref()->mutable_id()->set_id(
++                channel_tracker.get_create_channel(parent_ref));
++            map_channel[parent_ref].emplace_back(new_op->mutable_locate()->mutable_parent_ref());
++        }
++
+         return success();
+     };
+ 
+diff --git a/lib/Target/ProtoEmitter/tortilla/proto/ops.proto b/lib/Target/ProtoEmitter/tortilla/proto/ops.proto
+index df0a57e..891c5bb 100644
+--- a/lib/Target/ProtoEmitter/tortilla/proto/ops.proto
++++ b/lib/Target/ProtoEmitter/tortilla/proto/ops.proto
+@@ -258,6 +258,11 @@ message Locate {
+   RefStream output_ref2 = 4;
+   CrdStream output_crd = 5;
+   string label = 6;
++  // Set when the located level is not the tensor's first: the references of the level above
++  // (one per located fiber) and the tensor/mode whose shape file gives the located level's extent
++  RefStream parent_ref = 7;
++  string tensor = 8;
++  uint64 mode = 9;
+ }
+ 
+ message CoordDrop {

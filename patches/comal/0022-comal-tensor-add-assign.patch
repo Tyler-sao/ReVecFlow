@@ -1,0 +1,76 @@
+From dff320505401ba097ea9e0f5de0632f83577cd1d Mon Sep 17 00:00:00 2001
+From: v3 <v3@local>
+Date: Tue, 13 Oct 2026 00:41:04 +0800
+Subject: [PATCH] 0022-comal-tensor-add-assign
+
+---
+ src/templates/tensor.rs |  5 ++++-
+ tests/block_values.rs   | 40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+ create mode 100644 tests/block_values.rs
+
+diff --git a/src/templates/tensor.rs b/src/templates/tensor.rs
+index 25c6ec9..191dc97 100644
+--- a/src/templates/tensor.rs
++++ b/src/templates/tensor.rs
+@@ -212,7 +212,10 @@ where
+         Add<&'a ArrayBase<OwnedRepr<A>, D>, Output = ArrayBase<OwnedRepr<A>, D>>,
+ {
+     fn add_assign(&mut self, rhs: Self) {
+-        self.data.to_owned().add_assign(&rhs.data.to_owned());
++        // 0022: the sum used to be added to a temporary copy and dropped, so `tile += x` left the tile unchanged
++        let mut data = self.data.to_owned();
++        data += &rhs.data;
++        self.data = CowArray::from(data);
+     }
+ }
+ 
+diff --git a/tests/block_values.rs b/tests/block_values.rs
+new file mode 100644
+index 0000000..e1e30f9
+--- /dev/null
++++ b/tests/block_values.rs
+@@ -0,0 +1,40 @@
++// V3 diagnosis: do block values survive parsing, tile arithmetic, a DAM channel and the value writer?
++use comal::templates::primitive::Token;
++use comal::templates::tensor::{PrimitiveType, Tensor};
++use comal::templates::utils::read_inputs_vectorized;
++use comal::templates::wr_scanner::ValsWrScan;
++use dam::simulation::*;
++use dam::utility_contexts::GeneratorContext;
++use ndarray::Ix2;
++use std::io::Write;
++
++type VT16 = Tensor<'static, f32, Ix2, 16>;
++
++#[test]
++fn block_values_survive() {
++    let path = std::env::temp_dir().join("bv_vals");
++    let mut f = std::fs::File::create(&path).unwrap();
++    for i in 0..512 { writeln!(f, "{}", i % 7 + 1).unwrap(); }
++    drop(f);
++    let tiles: Vec<VT16> = read_inputs_vectorized(&path, PrimitiveType::<VT16>::new());
++    println!("parsed {} tiles, sums {} {}", tiles.len(), tiles[0].data.sum(), tiles[1].data.sum());
++    let p = Tensor::new(tiles[0].data.dot(&tiles[1].data));
++    let s: VT16 = p.clone() + tiles[0].clone();
++    println!("product sum {}, product + tile sum {}", p.data.sum(), s.data.sum());
++    let mut ctx = ProgramBuilder::default();
++    let (snd, rcv) = ctx.unbounded::<Token<VT16, u32>>();
++    let t0 = tiles[0].clone();
++    ctx.add_child(GeneratorContext::new(move || vec![Token::Val(t0.clone()), Token::Stop(0), Token::Done].into_iter(), snd));
++    let wr = ValsWrScan::new(rcv);
++    let out = wr.out_val.clone();
++    ctx.add_child(wr);
++    ctx.initialize(Default::default()).unwrap().run(Default::default());
++    let got = out.lock().unwrap();
++    println!("writer holds {} tiles, first sum {}", got.len(), got.first().map(|t| t.data.sum()).unwrap_or(-1.0));
++    let mut acc = VT16::default();
++    acc += tiles[0].clone();
++    acc += tiles[1].clone();
++    println!("accumulated sum {} (expected {})", acc.data.sum(), tiles[0].data.sum() + tiles[1].data.sum());
++    assert_eq!(acc.data.sum(), tiles[0].data.sum() + tiles[1].data.sum());
++    assert!(tiles[0].data.sum() > 0.0);
++}
+-- 
+2.43.0
+

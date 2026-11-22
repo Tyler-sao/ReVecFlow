@@ -1,0 +1,118 @@
+From 3202ce8d7d3133a0b5b349814c9884b0a12a6022 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 16 Oct 2026 12:37:30 +0800
+Subject: [PATCH] 0023-comal-block-locate-parent
+
+---
+ src/proto_driver/mod.rs | 42 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/src/proto_driver/mod.rs b/src/proto_driver/mod.rs
+index 744864c..9cc6fe7 100644
+--- a/src/proto_driver/mod.rs
++++ b/src/proto_driver/mod.rs
+@@ -1548,19 +1548,25 @@ pub fn build_from_proto_parameterized<'a>(
+                 }
+             },
+             Op::Locate(op) => {
+-                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_id = get_ref_id(&op.input_ref);
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let out_ref1_id = get_ref_id(&op.output_ref1);
+                 let out_ref2_id = get_ref_id(&op.output_ref2);
+                 let out_crd_id = get_crd_id(&op.output_crd);
+-                let locate = IterateLocate::new(
++                let mut locate = IterateLocate::new(
+                     refmap.get_receiver(in_ref_id, builder),
+                     crdmap.get_receiver(in_crd_id, builder),
+                     refmap.get_sender(out_ref1_id, builder),
+                     refmap.get_sender(out_ref2_id, builder),
+                     crdmap.get_sender(out_crd_id, builder),
+                 );
++                if op.parent_ref.is_some() {
++                    // 0023: as the scalar builder (0015); in block mode a level's extent in the shape file is in tiles,
++                    // the unit of the references and coordinates
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(refmap.get_receiver(get_ref_id(&op.parent_ref), builder), shapes[op.mode as usize]);
++                }
+                 builder.add_child(locate);
+             }
+             _ => todo!(),
+@@ -2199,19 +2205,25 @@ fn build_from_proto_block16_impl<'a>(
+                 }
+             },
+             Op::Locate(op) => {
+-                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_id = get_ref_id(&op.input_ref);
+                 let in_crd_id = get_crd_id(&op.input_crd);
+                 let out_ref1_id = get_ref_id(&op.output_ref1);
+                 let out_ref2_id = get_ref_id(&op.output_ref2);
+                 let out_crd_id = get_crd_id(&op.output_crd);
+-                let locate = IterateLocate::new(
++                let mut locate = IterateLocate::new(
+                     refmap.get_receiver(in_ref_id, builder),
+                     crdmap.get_receiver(in_crd_id, builder),
+                     refmap.get_sender(out_ref1_id, builder),
+                     refmap.get_sender(out_ref2_id, builder),
+                     crdmap.get_sender(out_crd_id, builder),
+                 );
++                if op.parent_ref.is_some() {
++                    // 0023: as the scalar builder (0015); in block mode a level's extent in the shape file is in tiles,
++                    // the unit of the references and coordinates
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(refmap.get_receiver(get_ref_id(&op.parent_ref), builder), shapes[op.mode as usize]);
++                }
+                 builder.add_child(locate);
+             }
+             _ => todo!(),
+@@ -2520,13 +2532,20 @@ fn build_from_proto_block32_impl<'a>(
+                 join::Conn::Repsig(_) => panic!("join repsig"),
+             },
+             Op::Locate(op) => {
+-                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let in_ref_r = refmap.get_receiver(get_ref_id(&op.input_ref), builder);
+                 let in_crd_r = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+                 let out_ref1 = refmap.get_sender(get_ref_id(&op.output_ref1), builder);
+                 let out_ref2 = refmap.get_sender(get_ref_id(&op.output_ref2), builder);
+                 let out_crd = crdmap.get_sender(get_crd_id(&op.output_crd), builder);
+-                builder.add_child(IterateLocate::new(in_ref_r, in_crd_r, out_ref1, out_ref2, out_crd));
++                let mut locate = IterateLocate::new(in_ref_r, in_crd_r, out_ref1, out_ref2, out_crd);
++                if op.parent_ref.is_some() {
++                    // 0023: as the scalar builder (0015); in block mode a level's extent in the shape file is in tiles,
++                    // the unit of the references and coordinates
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(refmap.get_receiver(get_ref_id(&op.parent_ref), builder), shapes[op.mode as usize]);
++                }
++                builder.add_child(locate);
+             }
+             _ => todo!(),
+         }
+@@ -2739,13 +2758,20 @@ fn build_from_proto_block64_impl<'a>(
+                 join::Conn::Repsig(_) => panic!("join repsig"),
+             },
+             Op::Locate(op) => {
+-                assert!(op.parent_ref.is_none(), "locate with a parent reference is only implemented in the scalar builder");
+                 let input_ref = refmap.get_receiver(get_ref_id(&op.input_ref), builder);
+                 let input_crd = crdmap.get_receiver(get_crd_id(&op.input_crd), builder);
+                 let output_ref1 = refmap.get_sender(get_ref_id(&op.output_ref1), builder);
+                 let output_ref2 = refmap.get_sender(get_ref_id(&op.output_ref2), builder);
+                 let output_crd = crdmap.get_sender(get_crd_id(&op.output_crd), builder);
+-                builder.add_child(IterateLocate::new(input_ref, input_crd, output_ref1, output_ref2, output_crd));
++                let mut locate = IterateLocate::new(input_ref, input_crd, output_ref1, output_ref2, output_crd);
++                if op.parent_ref.is_some() {
++                    // 0023: as the scalar builder (0015); in block mode a level's extent in the shape file is in tiles,
++                    // the unit of the references and coordinates
++                    let shape_filename = base_path.join(format!("tensor_{}_mode_shape", op.tensor));
++                    let shapes: Vec<CT> = read_inputs(&shape_filename);
++                    locate.set_parent(refmap.get_receiver(get_ref_id(&op.parent_ref), builder), shapes[op.mode as usize]);
++                }
++                builder.add_child(locate);
+             }
+             _ => todo!(),
+         }
+-- 
+2.43.0
+
